@@ -22,9 +22,11 @@ import requests
 import numpy as np
 import metpy.calc as mcalc
 from metpy.units import units
+from pytz import utc # pylint: disable=E0401
 import cv2 # pylint: disable=E0401
 import ephem # pylint: disable=E0401
 import zwoasi as asi # pylint: disable=E0401
+from apscheduler.schedulers.background import BackgroundScheduler # pylint: disable=E0401
 from FriendlyELEC_NanoHatMotor import FriendlyELEC_NanoHatMotor as NanoHatMotor # pylint: disable=E0401
 
 __author__ = 'Rainer Minixhofer'
@@ -256,6 +258,106 @@ class dht22Thread(threading.Thread):
                 print("Waited", self.timeout, "seconds, and did not get any valid data from DHT22")
             if self.stopped.wait(self.read_interval):
                 break
+
+def lmt2utc(lmt, longitude):
+    """
+    :param lmt: string Ex. '2008-12-2'
+    :param longitude: longitude
+    :return: UTC time stamp resembling lmt
+    """
+    utcdt = lmt - datetime.timedelta(seconds=round(4*60*longitude*180/math.pi))
+    utcdt = utcdt.replace(tzinfo=utc)
+    return utcdt
+
+def getanalemma(args, camera, imgarray, img, threads):
+    """
+    Captures one image of the current sun position to be assembled into one analemma
+    """
+    # Generate analemma subdirectory if this directory is not present and if the analemma parameter is specified
+    analemmabase = args.dirname + "/analemma"
+    if not os.path.isdir(analemmabase):
+        try:
+            os.mkdir(analemmabase)
+        except OSError:
+            print("Creation of the analemma subdirectory %s failed" % analemmabase)
+    # Use autoexposure for analemma
+    camera.set_control_value(asi.ASI_EXPOSURE, args.exposure, auto=True)
+    # zero gain and no autogain for analemma
+    camera.set_control_value(asi.ASI_GAIN, 0, auto=False)
+
+    # start video capture
+    try:
+        # Force any single exposure to be halted
+        camera.stop_video_capture()
+        camera.stop_exposure()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except:
+        pass
+
+    camera.start_video_capture()
+
+    # read image as bytearray from camera
+    print("Starting analemma capture\n")
+
+    if exp_ms <= 100 and lastisday:
+        timeoutms = 200
+    elif lastisday:
+        timeoutms = exp_ms*2
+    else:
+        timeoutms = None
+    try:
+        camera.capture_video_frame(buffer_=imgarray, filename=None, timeout=timeoutms)
+    except:
+        print("Exposure timeout, increasing exposure time\n")
+
+    print("Stopping Exposure")
+    # read current camera parameters
+    autoExp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
+    print("Autoexposure: %d us" % autoExp)
+    # Get current time
+    timestring = datetime.datetime.now()
+    # Define file base string (for image and image info file)
+    filebase = analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S")
+    # convert bytearray to numpy array
+    nparray = np.frombuffer(imgarray, nparraytype)
+
+    # Debayer image in the case of RAW8 or RAW16 images
+    if dodebayer:
+        # reshape numpy array back to image matrix depending on image type.
+        # take care that opencv channel order is B,G,R instead of R,G,B
+        imgbay = nparray.reshape((args.height, args.width, channels))
+        cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+bayerpatt[bayerindx][2:][::-1]+\
+                               '2BGR'+debayeralgext), img, 0)
+    else:
+        # reshape numpy array back to image matrix depending on image type
+        img = nparray.reshape((args.height, args.width, channels))
+
+    # postprocess image
+    # If aperture should be masked, apply circular masking
+    if args.maskaperture:
+        #Do mask operation
+        img *= mask
+
+    # write image based on extension specification and data compression parameters
+    if args.extension == 'jpg':
+        thread = saveThread(filebase+'.jpg', args.dirtime_12h_ago, img, \
+                            [int(cv2.IMWRITE_JPEG_QUALITY), args.jpgquality])
+        thread.start()
+    #    print('Saved to %s' % filename)
+    elif args.extension == 'png':
+        thread = saveThread(filebase+'.png', args.dirtime_12h_ago, img, \
+                            [int(cv2.IMWRITE_PNG_COMPRESSION), args.pngcompression])
+        thread.start()
+    elif args.extension == 'tif':
+        # Use TIFFTAG_COMPRESSION=259 to specify COMPRESSION_LZW=5
+        thread = saveThread(filebase+'.tif', args.dirtime_12h_ago, img, [259, 5])
+        thread.start()
+    #    print('Saved to %s' % filename)
+    threads.append(thread)
+
+    camera.stop_video_capture()
+    camera.stop_exposure()
 
 def turnOffMotors():
     """
@@ -599,7 +701,7 @@ parser.add_argument('--focusscale',
 
 # Do analemma exposures
 parser.add_argument('--analemma',
-                    default='',
+                    default='meanmidday',
                     const='meanmidday',
                     nargs='?',
                     type=str,
@@ -864,6 +966,18 @@ dht22thread = dht22Thread(dht22stopFlag, camera, 300, 10)
 dht22thread.start()
 threads.append(dht22thread)
 
+
+if args.analemma != '':
+    # initialize scheduler with UTC time
+    scheduler = BackgroundScheduler(timezone=utc.zone)
+    # Calculate trigger UTC time from mean local time
+    if args.analemma.lower() == 'meanmidday':
+        args.analemma = '12:00:00'
+    analemmatrigger = lmt2utc(datetime.datetime.strptime(args.analemma, '%H:%M:%S'), position.lon)
+    print('Analemma Trigger Time in UTC: %s' % analemmatrigger.time())
+    scheduler.start()
+    scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, imgarray, img, threads], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second)
+
 #bMain = False
 
 while bMain:
@@ -874,98 +988,6 @@ while bMain:
             # At daytime with --daytime not specified, skip day time capture
             print("It's daytime... we're not saving images")
             time.sleep(args.delayDaytime/1000)
-        elif args.analemma != '':
-            # Generate analemma subdirectory if this directory is not present and if the analemma parameter is specified
-            analemmabase = args.dirname + "/analemma"
-            if not os.path.isdir(analemmabase):
-                try:
-                    os.mkdir(analemmabase)
-                except OSError:
-                    print("Creation of the analemma subdirectory %s failed" % analemmabase)
-            # Use autoexposure
-            expms = 32
-            print("Press Ctrl+C to stop\n\n")
-            # autoexposure for analemma
-            camera.set_control_value(asi.ASI_EXPOSURE, currentExposure, auto=True)
-            # zero gain and no autogain for analemma
-            camera.set_control_value(asi.ASI_GAIN, 0, auto=False)
-            print("Starting analemma capture\n")
-
-            # start video capture
-            try:
-                # Force any single exposure to be halted
-                camera.stop_video_capture()
-                camera.stop_exposure()
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except:
-                pass
-
-            camera.start_video_capture()
-
-            # read image as bytearray from camera
-            print("Starting Exposure")
-
-            if exp_ms <= 100 and lastisday:
-                timeoutms = 200
-            elif lastisday:
-                timeoutms = exp_ms*2
-            else:
-                timeoutms = None
-            try:
-                camera.capture_video_frame(buffer_=imgarray, filename=None, timeout=timeoutms)
-            except:
-                print("Exposure timeout, increasing exposure time\n")
-
-            print("Stopping Exposure")
-            # read current camera parameters
-            autoExp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
-            print("Autoexposure: %d us" % autoExp)
-            autoGain = camera.get_control_value(asi.ASI_GAIN)[0]
-            # Get current time
-            timestring = datetime.datetime.now()
-            # Define file base string (for image and image info file)
-            filebase = analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S")
-            # convert bytearray to numpy array
-            nparray = np.frombuffer(imgarray, nparraytype)
-
-            # Debayer image in the case of RAW8 or RAW16 images
-            if dodebayer:
-                # reshape numpy array back to image matrix depending on image type.
-                # take care that opencv channel order is B,G,R instead of R,G,B
-                imgbay = nparray.reshape((args.height, args.width, channels))
-                cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+bayerpatt[bayerindx][2:][::-1]+\
-                                       '2BGR'+debayeralgext), img, 0)
-            else:
-                # reshape numpy array back to image matrix depending on image type
-                img = nparray.reshape((args.height, args.width, channels))
-
-            # postprocess image
-            # If aperture should be masked, apply circular masking
-            if args.maskaperture:
-                #Do mask operation
-                img *= mask
-
-            # write image based on extension specification and data compression parameters
-            if args.extension == 'jpg':
-                thread = saveThread(analemmabase+'.jpg', args.dirtime_12h_ago, img, \
-                                    [int(cv2.IMWRITE_JPEG_QUALITY), args.jpgquality])
-                thread.start()
-            #    print('Saved to %s' % filename)
-            elif args.extension == 'png':
-                thread = saveThread(analemmabase+'.png', args.dirtime_12h_ago, img, \
-                                    [int(cv2.IMWRITE_PNG_COMPRESSION), args.pngcompression])
-                thread.start()
-            elif args.extension == 'tif':
-                # Use TIFFTAG_COMPRESSION=259 to specify COMPRESSION_LZW=5
-                thread = saveThread(analemmabase+'.tif', args.dirtime_12h_ago, img, [259, 5])
-                thread.start()
-            #    print('Saved to %s' % filename)
-            threads.append(thread)
-
-            camera.stop_video_capture()
-            camera.stop_exposure()
-
         else:
             # We use the date 12hrs ago to ensure that we do not have a date
             # jump during night capture, especially for high latitudes
@@ -1216,6 +1238,7 @@ imgbay = None
 dht22stopFlag.set()
 
 # Finally wait for all threads to complete
+scheduler.shutdown()
 for t in threads:
     t.join()
 print("Exiting Capture")
