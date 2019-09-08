@@ -1,0 +1,126 @@
+    AutoExpMaxExpMS:
+        ControlType: 11
+        DefaultValue: 100
+        Description: 'Auto exposure maximum exposure value(unit ms)'
+        IsAutoSupported: False
+        IsWritable: True
+        MaxValue: 60000
+        MinValue: 1
+        Name: 'AutoExpMaxExpMS'
+    AutoExpMaxGain:
+        ControlType: 10
+        DefaultValue: 255
+        Description: 'Auto exposure maximum gain value'
+        IsAutoSupported: False
+        IsWritable: True
+        MaxValue: 510
+        MinValue: 0
+        Name: 'AutoExpMaxGain'
+    AutoExpTargetBrightness:
+        ControlType: 12
+        DefaultValue: 100
+        Description: 'Auto exposure maximum brightness value'
+        IsAutoSupported: False
+        IsWritable: True
+        MaxValue: 160
+        MinValue: 50
+        Name: 'AutoExpTargetBrightness'
+    BandWidth:
+        ControlType: 6
+        DefaultValue: 50
+        Description: 'The total data transfer rate percentage'
+        IsAutoSupported: True
+        IsWritable: True
+        MaxValue: 100
+        MinValue: 40
+        Name: 'BandWidth'
+    Exposure:
+        ControlType: 1
+        DefaultValue: 10000
+        Description: 'Exposure Time(us)'
+        IsAutoSupported: True
+        IsWritable: True
+        MaxValue: 2000000000
+        MinValue: 32
+        Name: 'Exposure'
+    Flip:
+        ControlType: 9
+        DefaultValue: 0
+        Description: 'Flip: 0->None 1->Horiz 2->Vert 3->Both'
+        IsAutoSupported: False
+        IsWritable: True
+        MaxValue: 3
+        MinValue: 0
+        Name: 'Flip'
+    Gain:
+        ControlType: 0
+        DefaultValue: 210
+        Description: 'Gain'
+        IsAutoSupported: True
+        IsWritable: True
+        MaxValue: 510
+        MinValue: 0
+        Name: 'Gain'
+    HardwareBin:
+        ControlType: 13
+        DefaultValue: 0
+        Description: 'Is hardware bin2:0->No 1->Yes'
+        IsAutoSupported: False
+        IsWritable: True
+        MaxValue: 1
+        MinValue: 0
+        Name: 'HardwareBin'
+    HighSpeedMode:
+        ControlType: 14
+        DefaultValue: 0
+        Description: 'Is high speed mode:0->No 1->Yes'
+        IsAutoSupported: False
+        IsWritable: True
+        MaxValue: 1
+        MinValue: 0
+        Name: 'HighSpeedMode'
+    MonoBin:
+        ControlType: 18
+        DefaultValue: 0
+        Description: 'bin R G G B to one pixel for color camera, color will loss'
+        IsAutoSupported: False
+        IsWritable: True
+        MaxValue: 1
+        MinValue: 0
+        Name: 'MonoBin'
+    Offset:
+        ControlType: 5
+        DefaultValue: 10
+        Description: 'offset'
+        IsAutoSupported: False
+        IsWritable: True
+        MaxValue: 600
+        MinValue: 0
+        Name: 'Offset'
+    Temperature:
+        ControlType: 8
+        DefaultValue: 20
+        Description: 'Sensor temperature(degrees Celsius)'
+        IsAutoSupported: False
+        IsWritable: False
+        MaxValue: 1000
+        MinValue: -500
+        Name: 'Temperature'
+    WB_B:
+        ControlType: 4
+        DefaultValue: 90
+        Description: 'White balance: Blue component'
+        IsAutoSupported: True
+        IsWritable: True
+        MaxValue: 99
+        MinValue: 1
+        Name: 'WB_B'
+    WB_R:
+        ControlType: 3
+        DefaultValue: 70
+        Description: 'White balance: Red component'
+        IsAutoSupported: True
+        IsWritable: True
+        MaxValue: 99
+        MinValue: 1
+        Name: 'WB_R'

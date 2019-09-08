@@ -1,0 +1,54 @@
+#Info from https://forum.up-community.org/discussion/2141/tutorial-gpio-i2c-spi-access-without-root-permissions
+
+Generate 50-gpio.rules file to enable GPIO access of gpio group
+
+#Info from Forum https://forum.armbian.com/topic/7511-nanopi-m4/?page=4
+The correct formula for the port number is (32p + 8q + r) , whe﻿e p, q, r are from the pin name  GPIOp_qr.  q is ABCD corresponding to 0123.
+For example, pin# 8, GPIO4_C1, port number = (32x4 + 8x2 + 1) = 145. 
+
+#Info from https://developer.ridgerun.com/wiki/index.php/How_to_use_GPIO_signals
+
+Dump the GPIO configuration.
+	cat /sys/kernel/debug/gpio
+
+#Info from FriendlyARM Wiki http://wiki.friendlyarm.com/wiki/index.php/NanoPi_M4#Diagram.2C_Layout_and_Dimension
+40 pin GPIO:
+============
+Pin# 	Port#	Assignment 			Port#	Pin# 	Assignment
+1 		VCC3V3_SYS 				2 	VDD_5V
+3 		I2C2_SDA(3V) 				4 	VDD_5V
+5 		I2C2_SCL(3V) 				6 	GND
+7 	32	GPIO1_A0(3V) 			145	8 	GPIO4_C1/I2C3_SCL(3V)
+9 		GND 				144	10 	GPIO4_C0/I2C3_SDA(3V)
+11 	33	GPIO1_A1(3V) 			50	12 	GPIO1_C2(3V)
+13 	35	GPIO1_A3(3V) 				14 	GND
+15 	36	GPIO1_A4(3V) 			54	16 	GPIO1_C6(3V)
+17 		VCC3V3_SYS 			55	18 	GPIO1_C7(3V)
+19 	40	GPIO1_B0/SPI1_TXD/UART4_TX(3V) 		20 	GND
+21 	39	GPIO1_A7/SPI1_RXD/UART4_RX(3V) 	56	22 	GPIO1_D0(3V)
+23 	41	GPIO1_B1/SPI1_CLK(3V) 		42	24 	GPIO1_B2/SPI1_CSn0(3V)
+25 		GND 				157	26 	GPIO4_C5/SPDIF_TX(3V)
+27 		I2C2_SDA(1.8V) 				28 	I2C2_SCL(1.8V)
+29 		I2S0_LRCK_RX(1.8V) 			30 	GND
+31 		I2S0_LRCK_TX(1.8V) 			32 	I2S_CLK(1.8V)
+33 		I2S0_SCLK(1.8V) 			34 	GND
+35 		I2S0_SDI0(1.8V) 			36 	I2S0_SDO0(1.8V)
+37 		I2S0_SDI1SDO3(1.8V) 			38 	I2S0_SDI2SDO2(1.8V)
+39 		GND 					40 	I2S0_SDI3SDO1(1.8V) 
+
+24-Pin GPIO2 Pin Spec:
+======================
+Pin# 	Port#	Assignment 			Port#	Pin# 	Assignment
+1 		VCC5V0_SYS 				2 	VCC5V0_SYS
+3 		PCIE_RX1_P 				4 	PCIE_TX1P
+5 		PCIE_RX1_N 				6 	PCIE_TX1N
+7 		GND 					8 	GND
+9 		PCIE_RX0_P 				10 	PCIE_TX0P
+11 		PCIE_RX0_N 				12 	PCIE_TX0N
+13 		GND 					14 	GND
+15 		PCIE_REF_CLKP 				16 	HOST0_DM
+17 		PCIE_REF_CLKN 				18 	HOST0_DP
+19 		GND 					20 	GND
+21 		PWR_KEY 				22 	HOST1_DM
+23 	158	GPIO4_C6/PWM1(3V) 			24 	HOST1_DP 
+

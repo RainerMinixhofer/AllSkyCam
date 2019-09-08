@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import sys
+sys.path.insert(0,"/usr/local/python")
+import time
+import ctypes as c
+import zwoasi as asi
+import cv2
+import ephem
+import math
+import numpy
+import datetime
+import threading
+import signal
+
+__author__ = 'Rainer Minixhofer'
+__version__ = '0.0.1'
+__license__ = 'MIT'
+
+bayerpatt = ['RGGB','BGGR','GRBG','GBRG'] # Sequence of Bayer pattern in rows then columns
+imgformat = ['RAW8','RGB24','RAW16','Y8'] # Supported image formats
+threadLock = threading.Lock()
+threads = []
+# env_filename = os.getenv('ZWO_ASI_LIB')
+asi_filename = '/usr/lib/libASICamera2.so'
+
+# Calculate if it is Day (Sun center above twilightalt) and save result in boolean isday
+def isday(output):
+    isday.position.date = datetime.datetime.utcnow()
+    if output:
+        print("Date and Time (UTC): %s" % isday.position.date)
+    sun=ephem.Sun(isday.position)
+    sun.compute(isday.position)
+    if sun.alt > args.twilightalt*math.pi/180:
+        if output:
+            print ('We have day... (sun altitude=%s)' % sun.alt)
+        return True
+    else :
+        if output:
+            print ('We have night... (sun altitude=%s)' % sun.alt)
+        return False
+
+def save_control_values(filename, settings):
+    filename += '.txt'
+    with open(filename, 'w') as f:
+        for k in sorted(settings.keys()):
+            f.write('%s: %s\n' % (k, str(settings[k])))
+    print('Camera settings saved to %s' % filename)
+
+class saveThread(threading.Thread):
+    def __init__(self, filename, img, params):
+        threading.Thread.__init__(self)
+        self.filename = filename
+        self.img = img
+        self.params = params
+    def run(self):
+        print("Saving image " + self.filename)
+        # Get lock to synchronize threads
+        threadLock.acquire()
+#        cv2.imwrite(self.filename,self.img,self.params)
+        cv2.imwrite(self.filename,self.img,self.params)
+        os.system("scp "+self.filename+" rainer@server03:/var/www/html/kameras/allskycam/")
+        # Free lock to release next thread
+        threadLock.release()
+
+bMain = True
+
+# Define parser for command lines
+def check_positive_int(value):
+    try:
+        ivalue=int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("%s is not an integer" % value)
+    if ivalue <=0:
+        raise argparse.ArgumentTypeError("%s is an invalid negative integer" % value)
+    return ivalue
+def check_nonnegative_int(value):
+    try:
+        ivalue=int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("%s is not an integer" % value)
+    if ivalue <0:
+        raise argparse.ArgumentTypeError("%s is an invalid negative integer" % value)
+    return ivalue
+def is_number(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        pass
+
+    try:
+        import unicodedata
+        unicodedata.numeric(s)
+        return True
+    except (TypeError, ValueError):
+        pass
+
+    return False
+
+parser = argparse.ArgumentParser(description='Process and save images from the AllSkyCamera')
+
+# Argument to specify location of ASI SDK Library (default specified in env_filename
+parser.add_argument('--ASIlib',
+                    nargs='?',
+                    const=asi_filename,
+                    default=asi_filename,
+                    help='ASI SDK library filename')
+# Argument to specify number of camera to use when more than one camera is attached
+parser.add_argument('--camnr',
+                    default=0,
+                    type=check_nonnegative_int,
+                    help='Specify number of camera to use (when multiple cameras are attached)')
+# Width and Height of final image capture size (default is maximum width and height)
+parser.add_argument('--width',
+                    default=0,
+                    type=int,
+                    help='Width of final image capture (0 if maximum width should be selected)')
+parser.add_argument('--height',
+                    default=0,
+                    type=check_nonnegative_int,
+                    help='Height of final image capture (0 if maximum height should be selected)')
+# Exposure setting
+parser.add_argument('--exposure',
+                    default=5000000,
+                    type=check_positive_int,
+                    help='Exposure time in us (default 5 sec)')
+# Maximum Exposure setting
+parser.add_argument('--maxexposure',
+                    default=10000,
+                    type=check_positive_int,
+                    help='Maximum Exposure time in ms (default 10 sec)')
+# Autoexposure setting
+parser.add_argument('--autoexposure',
+                    action='store_true',
+                    help='Specify to use autoexposure')
+# Gain setting
+parser.add_argument('--gain',
+                    default=210,
+                    type=check_positive_int,
+                    help='Gain (default 210)')
+# Maximum Gain setting
+parser.add_argument('--maxgain',
+                    default=510,
+                    type=check_positive_int,
+                    help='Maximum gain (default 510)')
+# Autogain setting
+parser.add_argument('--autogain',
+                    action='store_true',
+                    help='Specify to use auto gain')
+# Gamma setting
+parser.add_argument('--gamma',
+                    default=50,
+                    type=check_positive_int,
+                    help='Gamma (default 50)')
+# Brightness setting
+parser.add_argument('--brightness',
+                    default=50,
+                    type=check_positive_int,
+                    help='Brightness (default 50)')
+# White balance red setting
+parser.add_argument('--wbr',
+                    default=70,
+                    type=check_positive_int,
+                    help='White balance red (default 70)')
+# White balance blue setting
+parser.add_argument('--wbb',
+                    default=90,
+                    type=check_positive_int,
+                    help='White balance blue (default 90)')
+# Binning setting
+parser.add_argument('--bin',
+                    default=1,
+                    choices=range(1,5),
+                    type=int,
+                    help='Binning (1-4, default 1:no binning)')
+# Delay setting
+parser.add_argument('--delay',
+                    default=10,
+                    type=check_positive_int,
+                    help='Delay between images in ms (default 10 ms)')
+# Daytime delay setting
+parser.add_argument('--delayDaytime',
+                    default=5000,
+                    type=check_positive_int,
+                    help='Delay between images in Daytime in s (default 5000 ms = 5 s)')
+# Image type setting
+parser.add_argument('--type',
+                    default=0,
+                    choices=range(4),
+                    type=int,
+                    help='Image type (0:RAW8/1:RGB24/2:RAW16/3:Y8, default 0)')
+# PNG Image quality setting
+parser.add_argument('--pngcompression',
+                    default=3,
+                    type=int,
+                    help='Image compression (0-9, default 3)')
+# JPG Image quality setting
+parser.add_argument('--jpgquality',
+                    default=95,
+                    type=check_nonnegative_int,
+                    help='Image quality (0-100, default 95)')
+# USB speed setting
+parser.add_argument('--usbspeed',
+                    default=40,
+                    type=check_positive_int,
+                    help='USB speed/BandWidthOverload (40-100, default 40)')
+# Image filename setting
+parser.add_argument('--filename',
+                    default='image.png',
+                    help='Image filename (default "image.png")')
+# Image flip setting
+parser.add_argument('--flip',
+                    default=0,
+                    choices=range(4),
+                    type=int,
+                    help='Image flip setting (0:Original/1:Horizontal/2:vertical/3:both, default 0)')
+# Position latitude setting
+parser.add_argument('--lat',
+                    default='46.973066N',
+                    help='Position latitude (90S-90N, default 46.973N, Premstaetten)')
+# Position longitude setting
+parser.add_argument('--lon',
+                    default='15.398836E',
+                    help='Position longitude (180W-180E, default 15.399E, Premstaetten)')
+# Altitude of sun for twilight setting
+parser.add_argument('--twilight',
+                    default='Civil',
+                    help='Either twilight altitude of sun (-20-0) or predefined Twilight altitude setting (Astronomical:-18/Nautical:-12/Civil:-6, default Civil)')
+# Darkframe subtraction setting
+parser.add_argument('--darkframe',
+                    default='',
+                    const='darkframe.png',
+                    nargs='?',
+                    help='Specify image to subtract as dark frame (default "" which means no darkframe subtraction)')
+# Take Darkframe setting
+parser.add_argument('--takedarkframe',
+                    default='',
+                    action='store_true',
+                    help='Specify than image is taken as dark frame. No overlays and labels are shown. Dark frame is stored under <filename>')
+# Overlay text
+parser.add_argument('--text',
+                    default='',
+                    help='Character/Text Overlay. Use quotes e.g. "Text". Positioned at <textX>,<textY> with the properties given by the <font...> parameters. (Default "")')
+# Overlay text x position
+parser.add_argument('--textx',
+                    default=15,
+                    help='Text placement horizontal from left in pixels (Default 15)')
+# Overlay text y position
+parser.add_argument('--texty',
+                    default=25,
+                    type=check_positive_int,
+                    help='Text placement vertical from top in pixels (Default 25)')
+# Name of font
+parser.add_argument('--fontname',
+                    default=0,
+                    choices=range(7),
+                    help='Font type number (0-7 ex. 0:simplex/4:triplex/7:script, default 0)')
+# Color of font
+parser.add_argument('--fontcolor',
+                    default=[255,0,0],
+                    nargs=3,
+                    help='Font color (default [255,0,0]: blue)')
+# Line type of font
+parser.add_argument('--fontlinetype',
+                    default=0,
+                    choices=range(2),
+                    help='Font line type (0:AA/1:8/2:4, default 0)')
+# Size of font
+parser.add_argument('--fontsize',
+                    default=0.5,
+                    help='Font size (default 0.5)')
+# Line type of font
+parser.add_argument('--fontlinethick',
+                    default=1,
+                    choices=range(1,5),
+                    help='Font line thickness (1-5, default 1)')
+# Time labeling setting
+parser.add_argument('--time',
+                    action='store_true',
+                    help='Adds time info to image. Use textx and texty for placement.')
+# Daytime capture setting
+parser.add_argument('--daytime',
+                    action='store_true',
+                    help='Stores timelapse images at daytime too.')
+# Metadata labeling setting
+parser.add_argument('--details',
+                    action='store_true',
+                    help='Show additional metadata in image')
+# Debayer Algorithm (only for RAW image processing
+parser.add_argument('--debayeralg',
+                    default='none',
+                    help='''Debayer algorithm when using image type RAW8 or RAW16 (none/bl/vng/ea, default none).
+                                bl/bilinear.....................bilinear interpolation between pixels (RAW8/RAW16)
+                                vng/variablenumberofgradients...variable number of gradients interpolation (only RAW8)
+                                ea/edgeaware....................edge-aware interpolation (RAW8/RAW16).''')
+
+args = parser.parse_args()
+# Check validity of parameters
+if args.lat[-1] not in ['N','S']:
+    print ('Latitude specification must be a degree float ending with "N" or "S"')
+    exit()
+if args.lon[-1] not in ['W','E']:
+    print ('Longitude specification must be a degree float ending with "W" or "E"')
+    exit()
+if args.lat[-1]=='S':
+    args.lat=-float(args.lat[:-2])
+else:
+    args.lat=float(args.lat[:-2])
+if args.lon[-1]=='W':
+    args.lon=-float(args.lon[:-2])
+else:
+    args.lon=float(args.lon[:-2])
+if not(0 <= args.pngcompression <= 9):
+    print ('PNG File compression setting has to be in the interval [0,9]')
+    exit()
+if is_number(args.twilight)==False:
+    tl=args.twilight.lower()
+    if tl[:5] == 'civil':
+        args.twilightalt=-6
+    elif tl[:5] == 'astro':
+        args.twilightalt=-18
+    elif tl[:4] == 'naut':
+        args.twilightalt=-12
+    else:
+        print ('Wrong --twilight argument. Should read Civil, Astronomical or Nautical!')
+        exit()
+else:
+    args.twilightalt=args.twilight
+if args.debayeralg.lower() in ['none','bilinear','bl','variablenumberofgradients','vng','edgeaware','ea']:
+    if args.debayeralg.lower() in ['bl','bilinear']:
+        debayeralgext=''
+    elif (args.debayeralg.lower() in ['vng','variablenumberofgradients']) and args.type==2:
+        print ('debayer algorithm VNG just available for RAW8 images')
+        exit()
+    elif args.debayeralg.lower() in ['vng','variablenumberofgradients']:
+        debayeralgext='_VNG'
+    elif args.debayeralg.lower() in ['ea','edgeaware']:
+        debayeralgext='_EA'
+else:
+    print ('Wrong --debayeralg argument. Should read none, bilinear/bl, variablenumberofgradients/vng or edgeaware/ea')
+    exit()
+isday.position=ephem.Observer()
+isday.position.pressure = 0
+isday.position.lon=args.lon * math.pi / 180
+isday.position.lat=args.lat * math.pi / 180
+print("Position: Lat: %s / Lon: %s" % (isday.position.lat,isday.position.lon))
+
+if not os.path.isfile(args.ASIlib):
+    print('The filename of the SDK library "' + args.ASIlib +'" has not been found.')
+    sys.exit(1)
+
+# Initialize zwoasi with the name of the SDK library
+asi.init(args.ASIlib)
+
+num_cameras = asi.get_num_cameras()
+if num_cameras == 0:
+    print('No cameras found')
+    sys.exit(0)
+
+cameras_found = asi.list_cameras()  # Models names of the connected cameras
+
+if num_cameras == 1:
+    camera_id = 0
+    print('Found one camera: %s' % cameras_found[camera_id])
+else:
+    camera_id = args.camnr
+    print('Found %d cameras' % num_cameras)
+    for n in range(num_cameras):
+        print('    %d: %s' % (n, cameras_found[n]))
+    print('Using #%d: %s' % (camera_id, cameras_found[camera_id]))
+
+camera = asi.Camera(camera_id)
+camera_info = camera.get_camera_property()
+print('Camera Properties:')
+for k, v in camera_info.items():
+    if isinstance(v,list):
+        print('{:<28}:'.format(k),'[%s]' % ', '.join(map(str, v)))
+        if k=='SupportedVideoFormat':
+            print('{:<28}:'.format(k + ' decoded'),'[%s]' % ', '.join(map(lambda idx: str(imgformat[idx]), v)))
+    else:
+        print('{:<28}: {:<10}'.format(k, v))
+        if k=='BayerPattern':
+            bayerindx=v
+            print('{:<28}: {:<10}'.format(k + ' decoded', bayerpatt[bayerindx]))
+
+# Get all of the camera controls and export them to a text file
+controls = camera.get_controls()
+filenamecontrols = "controls.txt"
+with open(filenamecontrols, 'w') as f:
+    for cn in sorted(controls.keys()):
+        f.write('    %s:\n' % cn)
+        for k in sorted(controls[cn].keys()):
+            f.write('        %s: %s\n' % (k, repr(controls[cn][k])))
+print('Camera controls saved to %s' % filenamecontrols)
+
+# Check capabilities of camera and set parameters accordingly
+if not('Exposure' in controls and controls['Exposure']['IsAutoSupported']):
+    args.autoexposure=False
+if not('Gain' in controls and controls['Gain']['IsAutoSupported']):
+    args.autogain=False
+
+# Get temperature of camera
+print('Camera temperature          : {:4.1f}°C'.format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
+
+# Get maximum width and height from camera properties
+maxheight = camera_info['MaxHeight']
+if args.height==0 : args.height = maxheight
+maxwidth  = camera_info['MaxWidth']
+if args.width==0 : args.width = maxwidth
+
+# Adjust variables to chosen binning
+args.height//=args.bin
+args.height-= args.height % 2
+args.width//=args.bin
+args.width -= args.width % 8
+args.textx//=args.bin
+args.texty//=args.bin
+args.fontsize/=args.bin
+args.fontlinethick//=args.bin
+
+print('Selected Image dimensions: %s,%s (binning %d)' % (args.width,args.height,args.bin))
+
+# Set region of interest
+camera.set_roi_format(args.width,args.height,args.bin,args.type)
+
+# Use minimum USB bandwidth permitted
+camera.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, args.usbspeed)
+
+# Set some sensible defaults. They will need adjusting depending upon
+# the sensitivity, lens and lighting conditions used.
+#if args.darkframe :
+#    filename='image_color.jpg'
+#    camera.enable_dark_subtract(filename=filename)
+#else :
+camera.disable_dark_subtract()
+
+# get parameters to decode image based on image type specification
+camera.set_image_type(args.type)
+print('Capturing a single, ' + ('color' if camera_info['IsColorCam'] and args.type!=3 else 'monochrome') + ' ('+imgformat[args.type]+') image')
+if args.type==asi.ASI_IMG_RAW8: #RAW8 Uninterpolated Bayer pattern 8bit per pixel
+    pixelstorage=1
+    nparraytype='uint8'
+    channels=1
+if args.type==asi.ASI_IMG_RGB24: #RGB24 Interpolated 3 (RGB) channels per pixel
+    pixelstorage=3
+    nparraytype='uint8'
+    channels=3
+if args.type==asi.ASI_IMG_RAW16: #RAW16 Uninterpolated Bayer pattern 16bin per pixel
+    pixelstorage=2
+    nparraytype='uint16'
+    channels=1
+if args.type==3: #Y8: One byte (Y) per Bayer pattern
+    pixelstorage=1
+    nparraytype='uint8'
+    channels=1
+
+filename = args.filename
+
+# Check if image directory exists otherwise create it
+
+dirname = os.getcwd()
+
+if not(os.path.isdir(dirname + "/images")):
+    try:
+        os.mkdir(dirname + "/images")
+    except OSError:
+        print("Creation of the images directory %s failed" % dirname + "/images")
+
+camera.set_control_value(asi.ASI_EXPOSURE, args.exposure, auto=args.autoexposure)
+camera.set_control_value(asi.ASI_AUTO_MAX_EXP, args.maxexposure)
+camera.set_control_value(asi.ASI_GAIN, args.gain, auto=args.autogain)
+camera.set_control_value(asi.ASI_AUTO_MAX_GAIN, args.maxexposure)
+camera.set_control_value(asi.ASI_WB_B, args.wbb)
+camera.set_control_value(asi.ASI_WB_R, args.wbr)
+camera.set_control_value(asi.ASI_GAMMA, args.gamma)
+camera.set_control_value(asi.ASI_BRIGHTNESS, args.brightness)
+camera.set_control_value(asi.ASI_FLIP, args.flip)
+
+currentExposure = args.exposure
+exp_ms = 0
+autoGain = 0
+autoExp = 0
+
+# get bytearray for buffer to store image
+imgarray=bytearray(args.width*args.height*pixelstorage)
+
+while bMain :
+
+    try:
+        lastisday=isday(True)
+        if lastisday and not(args.daytime):
+            # At daytime with --daytime not specified, skip day time capture
+            print("It's daytime... we're not saving images")
+            time.sleep(args.delayDaytime/1000)
+        else:
+            # We use the date 12hrs ago to ensure that we do not have a date jump during night capture, especially for high latitudes
+            # where twilight can occur after midnight
+            time_12h_ago=datetime.datetime.now() - datetime.timedelta(hours = 12)
+            dirtime_12h_ago=dirname + "/images/" + time_12h_ago.strftime("%Y%m%d")
+            if not(os.path.isdir(dirtime_12h_ago)):
+                try:
+                    os.mkdir(dirtime_12h_ago)
+                except OSError:
+                    print("Creation of the images subdirectory %s failed" % dirtime_12h_ago)
+
+            if args.autoexposure and not(lastisday): # autoexposure at night
+                print ("Saving auto exposed images every %d ms\n\n" % args.delay)
+            elif lastisday: # at day always autoexposure
+                print ("Saving auto exposed images every %d ms\n\n" % args.delayDaytime)
+                expms=32
+            else: # constant exposure at night
+                print ("Saving %d s exposure images every %d ms\n\n" % (currentExposure/1000000.0, args.delay))
+            print("Press Ctrl+C to stop\n\n")
+            camera.set_control_value(asi.ASI_EXPOSURE, currentExposure, auto=args.autoexposure or lastisday) # autoexposure always at day
+            camera.set_control_value(asi.ASI_GAIN, args.gain, auto=args.autogain and not(lastisday)) # autogain never at day
+            if lastisday:
+                print("Starting day time capture\n")
+            else:
+                print("Starting night time capture\n")
+
+            # start video capture
+            try:
+                # Force any single exposure to be halted
+                camera.stop_video_capture()
+                camera.stop_exposure()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except:
+                pass
+
+            camera.start_video_capture()
+
+            while bMain and lastisday==isday(False):
+
+                # read image as bytearray from camera
+                print("Starting Exposure")
+                if exp_ms<=100 and lastisday:
+                    timeoutms=200
+                elif lastisday:
+                    timeoutms=exp_ms*2
+                else:
+                    timeoutms=None
+                try:
+                    camera.capture_video_frame(buffer_=imgarray,filename=None, timeout=timeoutms)
+                except:
+                    print("Exposure timeout, increasing exposure time\n")
+                print("Stopping Exposure")
+                # read current camera parameters
+                autoExp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
+                print("Autoexposure: %d us" % autoExp)
+                autoGain = camera.get_control_value(asi.ASI_GAIN)[0]
+                # Get current time
+                timestring=datetime.datetime.now()
+                # save control values of camera
+                filebase=dirtime_12h_ago+'/'+filename[:-4]+timestring.strftime("%Y%m%d%H%M%S")
+                save_control_values(filebase, camera.get_control_values())
+                # convert bytearray to numpy array
+                nparray=numpy.frombuffer(imgarray,nparraytype)
+                # reshape numpy array back to image matrix depending on image type
+                img=nparray.reshape((args.height,args.width,channels))
+                # Debayer image in the case of RAW8 or RAW16 images
+                if (args.type==asi.ASI_IMG_RAW8 or args.type==asi.ASI_IMG_RAW16) and args.debayeralg!='none':
+                    img=cv2.cvtColor(img, eval('cv2.COLOR_BAYER_'+bayerpatt[bayerindx][2:][::-1]+'2RGB'+debayeralgext))
+                # postprocess image
+                # If time parameter is specified, print timestring
+                if args.time:
+                    args.text=timestring.strftime("%d.%b.%Y %X")
+                print ('Caption: %s'%args.text)
+                if args.takedarkframe=='':
+                    print ('Writing image caption');
+                    cv2.putText(img,str(args.text),(args.textx,args.texty),args.fontname,args.fontsize,args.fontcolor,args.fontlinethick,lineType=args.fontlinetype)
+                    if args.details:
+                        line=str('Sensor {:.1f}degC'.format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
+                        cv2.putText(img,line,(args.textx,int(args.texty+30/args.bin)),args.fontname,args.fontsize*0.8,args.fontcolor,args.fontlinethick,lineType=args.fontlinetype)
+                        if lastisday and autoExp<1000000:
+                            line='Exposure {:.3f} ms'.format(autoExp/1000)
+                        else:
+                            line='Exposure {:.3f} s'.format(autoExp/1000000)
+                        cv2.putText(img,line,(args.textx,int(args.texty+60/args.bin)),args.fontname,args.fontsize*0.8,args.fontcolor,args.fontlinethick,lineType=args.fontlinetype)
+                        line=str('Gain {:d}'.format(autoGain))
+                        cv2.putText(img,line,(args.textx,int(args.texty+90/args.bin)),args.fontname,args.fontsize*0.8,args.fontcolor,args.fontlinethick,lineType=args.fontlinetype)
+                # write image based on extension specification and data compression parameters
+                if filename.lower()[-3:]=='jpg' or filename.lower()[-3:]=='jpeg':
+                    thread = saveThread(filebase+'.jpg',img,[int(cv2.IMWRITE_JPEG_QUALITY),args.jpgquality])
+                    thread.start()
+                #    print('Saved to %s' % filename)
+                elif filename.lower()[-3:]=='png':
+                    thread = saveThread(filebase+'.png',img,[int(cv2.IMWRITE_PNG_COMPRESSION),args.pngcompression])
+                    thread.start()
+                #    print('Saved to %s' % filename)
+                threads.append(thread)
+
+                if (args.autogain and not(lastisday)):
+                    print ("Auto Gain value: %d\n" % autoGain)
+                if (args.autoexposure and not(lastisday)):
+                    print ("Auto Exposure value: %d ms\n" % round(autoExp/1000))
+
+                    # Apply delay before next exposure
+                    if (autoExp < args.maxexposure*1000):
+                        # if using auto-exposure and the actual exposure is less than the max, we still wait until we reach maxesposure.
+                        # This is important for a constant frame rate during timelapse generation
+#                        tsleep=(args.maxexposure - autoExp/1000.0 + args.delay) # in ms
+                        tsleep=(args.maxexposure + args.delay) # in ms
+                        print ("Sleeping %d ms\n" % tsleep)
+                    else:
+                        tsleep=args.delay # in ms
+                    time.sleep(tsleep/1000.0)
+                    print("Stop sleeping")
+                else:
+                    time.sleep(args.delayDaytime/1000.0 if lastisday else args.delay/1000.0)
+                if not(lastisday) and isday(False): # End of Night
+                    #
+                    #
+                    # Generate time lapse video here
+                    #
+                    #
+                    pass
+            camera.stop_video_capture()
+            camera.stop_exposure()
+    except KeyboardInterrupt:
+        bMain = False
+camera.close           
+img = None
+imgArray = None
+
+# Finally wait for all threads to complete
+for t in threads:
+    t.join()
+print("Exiting Capture")
