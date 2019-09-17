@@ -19,7 +19,7 @@
     AutoExpTargetBrightness:
         ControlType: 12
         DefaultValue: 100
-        Description: 'Auto exposure maximum brightness value'
+        Description: 'Auto exposure target brightness value'
         IsAutoSupported: False
         IsWritable: True
         MaxValue: 160
