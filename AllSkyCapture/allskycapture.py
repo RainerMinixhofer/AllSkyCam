@@ -203,16 +203,31 @@ class saveThread(threading.Thread):
     """
     thread for saving image
     """
-    def __init__(self, filename, img, params):
+    def __init__(self, filename, img, params, camctrls, imgstats, timestring):
         threading.Thread.__init__(self)
         self.filename = filename
         self.img = img
         self.params = params
+        self.camctrls = camctrls
+        self.imgstats = imgstats
+        self.timestring = timestring
     def run(self):
         print("Saving image " + self.filename)
         # Get lock to synchronize threads
         threadLock.acquire()
+        exiftags = {**camctrls, **imgstats}
         cv2.imwrite(self.filename, self.img, self.params)
+        # Generate dictionary of EXIF tags from camera control values and image statistics
+        exiftags['ExposureTime'] = exiftags.pop('Exposure')
+        exiftags['ChipTemperature'] = exiftags.pop('Temperature')
+        exiftags['Make'], exiftags['Model'] = cameras_found[camera_id].split(' ')
+        exiftags['AllDates'] = timestring.strftime("%Y.%m.%d %H:%M:%S")
+        exiftags['Artist'] = 'Rainer Minixhofer'
+        # Change/update EXIF tags in file
+        exifpars = ['/usr/bin/exiftool','-config', '/home/rainer/.ExifTool_config','-overwrite_original']
+        for tag, value in exiftags.iteritems():
+            exifpars.append("-{}={}".format(tag, value))
+        subprocess.run(exifpars, check=True)
         # Free lock to release next thread
         threadLock.release()
 
@@ -1272,9 +1287,6 @@ while bMain:
                     if args.debug:
                         print("==>Memory after masking: %s percent. " % psutil.virtual_memory()[2])
 
-                # save control values of camera and
-		        # do some simple statistics on image and save to associated text file with the camera settings
-                save_control_values(filebase, camera.get_control_values(), get_image_statistics(img))
                 # If time parameter is specified, print timestring
                 if args.time:
                     args.text = timestring.strftime("%d.%b.%Y %X")
@@ -1319,19 +1331,24 @@ while bMain:
                         cv2.putText(img, line, (args.textx, int(args.texty+180/args.bin)), \
                                     args.fontname, args.fontsize*0.8, args.fontcolor, \
                                     args.fontlinethick, lineType=args.fontlinetype)
+                # save control values of camera and
+		        # do some simple statistics on image and save to associated text file with the camera settings
+                camctrls = camera.get_control_values()
+                imgstats = get_image_statistics(img)
+                save_control_values(filebase, camctrls, imgstats)
                 # write image based on extension specification and data compression parameters
                 if args.extension == 'jpg':
                     thread = saveThread(filebase+'.jpg', img, \
-                                        [int(cv2.IMWRITE_JPEG_QUALITY), args.jpgquality])
+                                        [int(cv2.IMWRITE_JPEG_QUALITY), args.jpgquality], camctrls, imgstats, timestring)
                     thread.start()
                 #    print('Saved to %s' % filename)
                 elif args.extension == 'png':
                     thread = saveThread(filebase+'.png', img, \
-                                        [int(cv2.IMWRITE_PNG_COMPRESSION), args.pngcompression])
+                                        [int(cv2.IMWRITE_PNG_COMPRESSION), args.pngcompression], camctrls, imgstats, timestring)
                     thread.start()
                 elif args.extension == 'tif':
                     # Use TIFFTAG_COMPRESSION=259 to specify COMPRESSION_LZW=5
-                    thread = saveThread(filebase+'.tif', img, [259, 5])
+                    thread = saveThread(filebase+'.tif', img, [259, 5], camctrls, imgstats, timestring)
                     thread.start()
                 #    print('Saved to %s' % filename)
                 threads.append(thread)
