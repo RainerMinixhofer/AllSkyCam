@@ -2,7 +2,7 @@
 """
 Script for controlling the capture of images via the AllSky Camera
 """
-# pylint: disable=C0103,C0301,C0302,R0912,R0914,R0915,R0903,R0902,W1401,W0123,W0702,W0621
+# pylint: disable=C0103,C0301,C0302,R0912,R0913,R0914,R0915,R0903,R0902,W1401,W0123,W0702,W0621
 import sys
 import argparse
 import os
@@ -220,14 +220,22 @@ class saveThread(threading.Thread):
         # Generate dictionary of EXIF tags from camera control values and image statistics
         exiftags['ExposureTime'] = exiftags.pop('Exposure')
         exiftags['ChipTemperature'] = exiftags.pop('Temperature')
+        exiftags['ChipTemperature'] /= 10
+        exiftags['ImageMean'] = exiftags.pop('Mean')
+        exiftags['ImageStdDev'] = exiftags.pop('StdDev')
         exiftags['Make'], exiftags['Model'] = cameras_found[camera_id].split(' ')
         exiftags['AllDates'] = timestring.strftime("%Y.%m.%d %H:%M:%S")
         exiftags['Artist'] = 'Rainer Minixhofer'
         # Change/update EXIF tags in file
-        exifpars = ['/usr/bin/exiftool','-config', '/home/rainer/.ExifTool_config','-overwrite_original']
-        for tag, value in exiftags.iteritems():
+        exifpars = ['/usr/bin/exiftool', '-config', '/home/rainer/.ExifTool_config', '-overwrite_original']
+        for tag, value in exiftags.items():
             exifpars.append("-{}={}".format(tag, value))
-        subprocess.run(exifpars, check=True)
+        exifpars.append(self.filename)
+        process = subprocess.run(exifpars, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if args.debug:
+            print('EXIFtool stdout: %s' % process.stdout)
+        if args.debug:
+            print('EXIFtool stderr: %s' % process.stderr)
         # Free lock to release next thread
         threadLock.release()
 
