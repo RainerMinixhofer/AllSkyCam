@@ -215,27 +215,29 @@ class saveThread(threading.Thread):
         print("Saving image " + self.filename)
         # Get lock to synchronize threads
         threadLock.acquire()
-        exiftags = {**camctrls, **imgstats}
         cv2.imwrite(self.filename, self.img, self.params)
-        # Generate dictionary of EXIF tags from camera control values and image statistics
-        exiftags['ExposureTime'] = exiftags.pop('Exposure')
-        exiftags['ChipTemperature'] = exiftags.pop('Temperature')
-        exiftags['ChipTemperature'] /= 10
-        exiftags['ImageMean'] = exiftags.pop('Mean')
-        exiftags['ImageStdDev'] = exiftags.pop('StdDev')
-        exiftags['Make'], exiftags['Model'] = cameras_found[camera_id].split(' ')
-        exiftags['AllDates'] = timestring.strftime("%Y.%m.%d %H:%M:%S")
-        exiftags['Artist'] = 'Rainer Minixhofer'
-        # Change/update EXIF tags in file
-        exifpars = ['/usr/bin/exiftool', '-config', '/home/rainer/.ExifTool_config', '-overwrite_original']
-        for tag, value in exiftags.items():
-            exifpars.append("-{}={}".format(tag, value))
-        exifpars.append(self.filename)
-        process = subprocess.run(exifpars, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        if args.debug:
-            print('EXIFtool stdout: %s' % process.stdout)
-        if args.debug:
-            print('EXIFtool stderr: %s' % process.stderr)
+        if (args.metadata != None) and ('exif' in args.metadata):
+            print("Writing EXIF tags")
+            exiftags = {**camctrls, **imgstats}
+            # Generate dictionary of EXIF tags from camera control values and image statistics
+            exiftags['ExposureTime'] = exiftags.pop('Exposure')
+            exiftags['ChipTemperature'] = exiftags.pop('Temperature')
+            exiftags['ChipTemperature'] /= 10
+            exiftags['ImageMean'] = exiftags.pop('Mean')
+            exiftags['ImageStdDev'] = exiftags.pop('StdDev')
+            exiftags['Make'], exiftags['Model'] = cameras_found[camera_id].split(' ')
+            exiftags['AllDates'] = timestring.strftime("%Y.%m.%d %H:%M:%S")
+            exiftags['Artist'] = 'Rainer Minixhofer'
+            # Change/update EXIF tags in file
+            exifpars = ['/usr/bin/exiftool', '-config', '/home/rainer/.ExifTool_config', '-overwrite_original']
+            for tag, value in exiftags.items():
+                exifpars.append("-{}={}".format(tag, value))
+            exifpars.append(self.filename)
+            process = subprocess.run(exifpars, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            if args.debug:
+                print('EXIFtool stdout: %s' % process.stdout)
+            if args.debug:
+                print('EXIFtool stderr: %s' % process.stderr)
         # Free lock to release next thread
         threadLock.release()
 
@@ -884,6 +886,19 @@ parser.add_argument('--analemma',
                     the same directory as this script, if this file is present. \
                     (if specified without parameter "meanmidday" is taken)')
 
+# Define output types for image metadata
+parser.add_argument('--metadata',
+                    default='txt,exif',
+                    const=None,
+                    nargs='?',
+                    type=str,
+                    help='Targets for image metadata in comma separated list form. \
+                    Current available targets are "txt" and "exif". "txt" specifies that a text \
+                    file including the meta data with the same base name as the image is written. \
+                    "exif" specifies that the metadata is written into exif tags directly into the \
+                    images. If specified without parameter not metadata is written.\
+                    (Default both text and exif is written.)')
+
 args = parser.parse_args()
 
 args.dirname = os.getcwd()
@@ -1131,6 +1146,11 @@ if args.focusscale != '':
 else:
     focuscounter = -1
 
+# split arguments for metadata target specification
+    
+if args.metadata != None:
+    args.metadata = args.metadata.split(',')
+
 #Start Temperature and Humidity-Monitoring with DHT22 sensor. Read out every 5min (300sec) and timeout after 10sec
 
 dht22stopFlag = threading.Event()
@@ -1341,9 +1361,11 @@ while bMain:
                                     args.fontlinethick, lineType=args.fontlinetype)
                 # save control values of camera and
 		        # do some simple statistics on image and save to associated text file with the camera settings
-                camctrls = camera.get_control_values()
-                imgstats = get_image_statistics(img)
-                save_control_values(filebase, camctrls, imgstats)
+                if args.metadata != None:
+                    camctrls = camera.get_control_values()
+                    imgstats = get_image_statistics(img)
+                    if 'txt' in args.metadata:
+                        save_control_values(filebase, camctrls, imgstats)
                 # write image based on extension specification and data compression parameters
                 if args.extension == 'jpg':
                     thread = saveThread(filebase+'.jpg', img, \
