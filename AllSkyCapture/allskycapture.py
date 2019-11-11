@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 Script for controlling the capture of images via the AllSky Camera
+
+Created on Wed Oct 31 07:28:18 2018
+
+@author: Rainer Minixhofer
 """
 # pylint: disable=C0103,C0301,C0302,R0912,R0913,R0914,R0915,R0903,R0902,W1401,W0123,W0702,W0621
 import sys
@@ -24,6 +28,7 @@ from metpy.units import units
 from pytz import utc # pylint: disable=E0401
 import cv2 # pylint: disable=E0401
 import ephem # pylint: disable=E0401
+from astropy.io import fits # pylint: disable=E0401
 import zwoasi as asi # pylint: disable=E0401
 from apscheduler.schedulers.background import BackgroundScheduler # pylint: disable=E0401
 from FriendlyELEC_NanoHatMotor import FriendlyELEC_NanoHatMotor as NanoHatMotor # pylint: disable=E0401
@@ -378,7 +383,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
         autoex = settings['Exposure']
         if df != df_last:
             if args.debug:
-                print('   Exposure: {autoex:f} Dropped frames: {df:d}'
+                print('   Exposure: {autoex:f} \u03BCs Dropped frames: {df:d}'
                       .format(autoex=settings['Exposure'], df=df))
             if autoex == autoex_last:
                 matches += 1
@@ -389,7 +394,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
             df_last = df
             autoex_last = autoex
 
-    print("Final autoexposure: %d us" % autoex)
+    print("Final autoexposure: %d \u03BCs" % autoex)
 
     # read image as bytearray from camera
     print("Starting Analemma HDR capture\n")
@@ -401,9 +406,6 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
     camera.set_roi(start_x=origroi[0], start_y=origroi[1],
                    width=origroi[2], height=origroi[3])
 
-    print("Starting HDR exposure scale aquisition with {autoex:d}"
-          .format(autoex=autoex))
-
     imgs = []
 
     # Generate exposure scale upfront
@@ -411,6 +413,10 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
     # exposure time drops below minimum exposure time
     autoex *= 4
     times = []
+
+    print("Starting HDR exposure scale aquisition up to {autoex:d} \u03BCs"
+          .format(autoex=autoex))
+
     while autoex >= controls['Exposure']['MinValue']:
         times.append(autoex)
         autoex //= 2 # Scale exposure by % 2 for HDR scale
@@ -422,31 +428,33 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
     imgarray = bytearray(args.width*args.height*pixelstorage)
 
     # Do loop over exposures scaling them with a factor of 2
+
+    camera.set_control_value(controls['Gain']['ControlType'], 1)
+
     for i, exposure in enumerate(times):
         camera.set_control_value(controls['Exposure']['ControlType'], exposure, auto=False)
 
         camera.capture(buffer_=imgarray, filename=None)
 
         print("Exposure: %d us" % exposure)
+
         # Define file base string (for image and image info file)
         filebase = analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(exposure)
         # convert bytearray to numpy array
         nparray = np.frombuffer(imgarray, nparraytype)
-
-        # Define image array here, to ensure that an image array is generated with imgs.append below
-        img = np.zeros((args.height, args.width, 3), nparraytype)
+        # reshape numpy array back to image matrix depending on image type.
+        imgbay = nparray.reshape((args.height, args.width, args.channels))
 
         # Debayer image in the case of RAW8 or RAW16 images
         if dodebayer:
-            # reshape numpy array back to image matrix depending on image type.
+            # Define image array here, to ensure that an image array is generated with imgs.append below
+            img = np.zeros((args.height, args.width, 3), nparraytype)
             # take care that opencv channel order is B,G,R instead of R,G,B
-            imgbay = nparray.reshape((args.height, args.width, channels))
             cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+\
                                       bayerpatt[bayerindx][2:][::-1]+\
                                       '2BGR'+debayeralgext), img, 0)
         else:
-            # reshape numpy array back to image matrix depending on image type
-            img = nparray.reshape((args.height, args.width, channels))
+            img = np.copy(imgbay)
 
         # postprocess image
         # If aperture should be masked, apply circular masking
@@ -457,15 +465,13 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
         # save image and exposure time into array for postprocessing
         imgs.append(img)
 
-        while camera.get_exposure_status() != asi.ASI_EXP_IDLE:
-            time.sleep(sleep_interval)
-            print('Waiting with next frame until camera is ready')
-
     print("Analemma HDR frame capture finished.")
+    
+    print('File Extension is %s' % args.extension.upper())
 
     # write image based on extension specification and data compression parameters
     for i, img in enumerate(imgs):
-        print('Save %d frame of %d' % (i, len(imgs)))
+        print('Save %d frame of %d' % (i + 1, len(imgs)))
         filebase = analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i])
         if args.extension == 'jpg':
             cv2.imwrite(filebase+'.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY),
@@ -476,6 +482,13 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
         elif args.extension == 'tif':
             # Use TIFFTAG_COMPRESSION=259 to specify COMPRESSION_LZW=5
             cv2.imwrite(filebase+'.tif', img, [259, 5])
+        elif args.extension == 'fits':
+            # use astropy to write FITS image
+            if (args.channels == 1) and not dodebayer:
+                hdu = fits.PrimaryHDU(data=img[:,:,0])
+            else:
+                hdu = fits.PrimaryHDU(data=[img[:,:,0], img[:,:,1], img[:,:,2]])
+            hdu.writeto(filebase + '.fits')
 
 
     print("Restoring camera settings to original values.")
@@ -501,24 +514,24 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
     # convert images from 16bit to 8bit since algorithms does not support 16bit images
     for i, img in enumerate(imgs):
         img = np.uint8(img)
-    response = calibrate.process(imgs, times)
+#    response = calibrate.process(imgs, times)
 
     # Make HDR Image
-    merge_debevec = cv2.createMergeDebevec()
-    hdr = merge_debevec.process(imgs, times, response)
+#    merge_debevec = cv2.createMergeDebevec()
+#    hdr = merge_debevec.process(imgs, times, response)
 
     # Tonemap HDR image
-    tonemap = cv2.createTonemap(2.2)
-    ldr = tonemap.process(hdr)
+#    tonemap = cv2.createTonemap(2.2)
+#    ldr = tonemap.process(hdr)
 
     # Perform exposure fusion
-    merge_mertens = cv2.createMergeMertens()
-    fusion = merge_mertens.process(imgs)
+#    merge_mertens = cv2.createMergeMertens()
+#    fusion = merge_mertens.process(imgs)
 
     # Write results
-    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'fusion.png', fusion * 255)
-    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'ldr.png', ldr * 255)
-    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'hdr.hdr', hdr)
+#    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'fusion.png', fusion * 255)
+#    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'ldr.png', ldr * 255)
+#    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'hdr.hdr', hdr)
     print("Analemma HDR image processing finished")
 
 
@@ -698,7 +711,7 @@ parser.add_argument('--jpgquality',
                     help='Image quality (0-100, default 99)')
 # USB speed setting
 parser.add_argument('--usbspeed',
-                    default=40,
+                    default=90,
                     type=check_positive_int,
                     help='USB speed/BandWidthOverload (40-100, default 40)')
 # High speed mode setting
@@ -902,7 +915,7 @@ parser.add_argument('--metadata',
 args = parser.parse_args()
 
 args.dirname = os.getcwd()
-args.extension = args.filename.lower()[-3:]
+args.extension = args.filename.lower().split('.')[-1]
 
 # Do postprocessing if postprocessonly is set and exit
 if args.postprocessonly:
@@ -1078,22 +1091,22 @@ print('Capturing a single, ' + ('color' if camera_info['IsColorCam'] and \
 if args.type == asi.ASI_IMG_RAW8: #RAW8 Uninterpolated Bayer pattern 8bit per pixel
     pixelstorage = 1
     nparraytype = 'uint8'
-    channels = 1
+    args.channels = 1
     args.fontcolor = round(255 * args.fontcolor[0])
 if args.type == asi.ASI_IMG_RGB24: #RGB24 Interpolated 3 (RGB) channels per pixel
     pixelstorage = 3
     nparraytype = 'uint8'
-    channels = 3
+    args.channels = 3
     args.fontcolor = [round(255 * c) for c in args.fontcolor]
 if args.type == asi.ASI_IMG_RAW16: #RAW16 Uninterpolated Bayer pattern 16bin per pixel
     pixelstorage = 2
     nparraytype = 'uint16'
-    channels = 1
+    args.channels = 1
     args.fontcolor = [round(65535 * c) for c in args.fontcolor]
 if args.type == 3: #Y8: One byte (Y) per Bayer pattern
     pixelstorage = 1
     nparraytype = 'uint8'
-    channels = 1
+    args.channels = 1
     args.fontcolor = round(255 * args.fontcolor[0])
 
 # Check if image directory exists otherwise create it
@@ -1128,7 +1141,7 @@ dodebayer = (args.type == asi.ASI_IMG_RAW8 or args.type == asi.ASI_IMG_RAW16) an
 if args.maskaperture:
     print("Masking aperture")
     #Define mask image of same size as image
-    mask = np.zeros((args.height, args.width, 3 if dodebayer else channels), dtype=nparraytype)
+    mask = np.zeros((args.height, args.width, 3 if dodebayer else args.channels), dtype=nparraytype)
     #Define circle with origin in center of image and radius given by the smaller side of the image
 #    cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (255, 255, 255), -1)
     cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (1, 1, 1), -1)
@@ -1290,12 +1303,12 @@ while bMain:
                 if dodebayer:
                     # reshape numpy array back to image matrix depending on image type.
                     # take care that opencv channel order is B,G,R instead of R,G,B
-                    imgbay = nparray.reshape((args.height, args.width, channels))
+                    imgbay = nparray.reshape((args.height, args.width, args.channels))
                     cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+bayerpatt[bayerindx][2:][::-1]+\
                                            '2BGR'+debayeralgext), img, 0)
                 else:
                     # reshape numpy array back to image matrix depending on image type
-                    img = nparray.reshape((args.height, args.width, channels))
+                    img = nparray.reshape((args.height, args.width, args.channels))
 
                     if args.debug:
                         print("==>Memory after array reshaping: %s percent. " % psutil.virtual_memory()[2])
