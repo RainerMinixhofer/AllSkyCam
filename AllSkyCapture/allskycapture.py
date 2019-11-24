@@ -6,10 +6,11 @@ Created on Wed Oct 31 07:28:18 2018
 
 @author: Rainer Minixhofer
 """
-# pylint: disable=C0103,C0301,C0302,R0912,R0913,R0914,R0915,R0903,R0902,W1401,W0123,W0702,W0621
+# pylint: disable=C0301,C0302,C0103,R0914,R0912,R0915,R0913,R0902,R0903,W0123,W0702,W0621,W1401
 import sys
 import argparse
 import os
+import logging
 import time
 import subprocess
 import pipes
@@ -18,6 +19,7 @@ import math
 import datetime
 import threading
 import glob
+import copy
 from shutil import rmtree
 import atexit
 import psutil
@@ -26,9 +28,10 @@ import numpy as np
 import metpy.calc as mcalc
 from metpy.units import units
 from pytz import utc # pylint: disable=E0401
+from astropy.io import fits # pylint: disable=E0401
 import cv2 # pylint: disable=E0401
 import ephem # pylint: disable=E0401
-from astropy.io import fits # pylint: disable=E0401
+import smbus # pylint: disable=E0401
 import zwoasi as asi # pylint: disable=E0401
 from apscheduler.schedulers.background import BackgroundScheduler # pylint: disable=E0401
 from FriendlyELEC_NanoHatMotor import FriendlyELEC_NanoHatMotor as NanoHatMotor # pylint: disable=E0401
@@ -221,7 +224,7 @@ class saveThread(threading.Thread):
         # Get lock to synchronize threads
         threadLock.acquire()
         cv2.imwrite(self.filename, self.img, self.params)
-        if (args.metadata != None) and ('exif' in args.metadata):
+        if (args.metadata is not None) and ('exif' in args.metadata):
             print("Writing EXIF tags")
             exiftags = {**camctrls, **imgstats}
             # Generate dictionary of EXIF tags from camera control values and image statistics
@@ -298,6 +301,715 @@ class dht22Thread(threading.Thread):
                     print("Data could not be written into the Homatic system variables.")
             except subprocess.TimeoutExpired:
                 print("Waited", self.timeout, "seconds, and did not get any valid data from DHT22")
+            if self.stopped.wait(self.read_interval):
+                break
+
+class IRSensor:
+    """
+    Class for reading the MLX90614 IR Sensor over I2C. Default I2C address is 0x5a
+    """
+
+    # pylint: disable=C0326
+    # RAM Registers
+    __RAW1    = 0x04
+    __RAW2    = 0x05
+    __TA      = 0x06
+    __TO1     = 0x07
+    __TO2     = 0x08
+    # EEPROM Registers (address of EEPROM + 2x20 see Section 8.4.5 of MLX90614 Datasheet)
+    __TOMAX   = 0x00 + 0x20
+    __TOMIN   = 0x01 + 0x20
+    __PWMCTRL = 0x02 + 0x20
+    __TARANGE = 0x03 + 0x20
+    __EMISSIV = 0x04 + 0x20
+    __CONFIG1 = 0x05 + 0x20
+    __KE      = 0x0F + 0x20
+    __CONFIG2 = 0x19 + 0x20
+    # pylint: enable=C0326
+
+    @staticmethod
+    def getI2CBusNumber():
+        """
+        Gets the I2C bus number /dev/i2c-#
+        """
+        return 2
+
+    def __init__(self, address=0x5a, debug=True):
+        self.address = address
+        self.debug = debug
+        self.bus = smbus.SMBus(self.getI2CBusNumber())
+        if debug:
+            print("I2C Bus Number: %d" % self.getI2CBusNumber())
+
+    def errMsg(self, error):
+        """
+        returns I2C errors
+        """
+        print("Error accessing 0x%02X(%X): Check your I2C address" % (self.address, error))
+        return -1
+
+    # Only write16, readU16 and readS16 commands
+    # are supported. (see MLX90614 family, section 8.4.2)
+    def readU16(self, reg, little_endian=True):
+        "Reads an unsigned 16-bit value from the I2C device"
+        try:
+            result = 0xFFFA
+            while result == 0xFFFA:
+                result = self.bus.read_word_data(self.address, reg) & 0xFFFF
+            # Swap bytes if using big endian because read_word_data assumes little
+            # endian on ARM (little endian) systems.
+            if not little_endian:
+                result = ((result << 8) & 0xFF00) + (result >> 8)
+            if self.debug:
+                print("I2C: Device 0x%02X returned 0x%04X from reg 0x%02X" % (self.address, result & 0xFFFF, reg))
+            return result
+        except IOError as err:
+            return self.errMsg(err)
+
+    def readS16(self, reg, little_endian=True):
+        "Reads a signed 16-bit value from the I2C device"
+        try:
+            result = self.readU16(reg, little_endian)
+            if result > 32767:
+                result -= 65536
+            return result
+        except IOError as err:
+            return self.errMsg(err)
+
+    def write16(self, reg, value):
+        "Writes a 16-bit value to the specified register/address pair"
+        try:
+            self.bus.write_word_data(self.address, reg, value)
+            if self.debug:
+                print(("I2C: Wrote 0x%02X to register pair 0x%02X,0x%02X" %
+                       (value, reg, reg+1)))
+            return None
+        except IOError as err:
+            return self.errMsg(err)
+
+    def Ta(self, imperial=False):
+        """
+        Temperatur Factor set to0.02 degrees per LSB
+        (measurement resolution of the MLX90614)
+        """
+        tempFactor = 0.02
+        tempData = self.readU16(self.__TA)
+        tempData = (tempData * tempFactor)-0.01
+        if imperial:
+            #Ambient Temperature in Fahrenheit
+            return ((tempData - 273.15)*1.8) + 32
+        #Ambient Temperature in Celsius
+        return tempData - 273.15
+
+    def Tobj(self, imperial=False):
+        """
+        Temperatur Factor set to 0.02 degrees per LSB
+        (measurement resolution of the MLX90614)
+        """
+        tempFactor = 0.02
+        tempData = self.readU16(self.__TO1)
+        tempData = (tempData * tempFactor)-0.01
+        if imperial:
+            #Ambient Temperature in Fahrenheit
+            return ((tempData - 273.15)*1.8) + 32
+        #Ambient Temperature in Celsius
+        return tempData - 273.15
+
+class IRSensorThread(threading.Thread):
+    """
+    thread for reading MLX90614 IR Sensor
+    """
+    def __init__(self, event, camera, read_interval=None, timeout=None):
+        threading.Thread.__init__(self)
+        if read_interval is None:
+            self.read_interval = 5 * 60
+        else:
+            self.read_interval = read_interval
+        if timeout is None:
+            self.timeout = 5.0
+        else:
+            self.timeout = timeout
+        self.stopped = event
+        self.camera = camera
+        self.Ta = 0
+        self.Tobj = 0
+        self.IRsensor = IRSensor(debug=False)
+    def run(self):
+        while True:
+            try:
+                #Read data of MLX90614 IR sensor
+                self.Ta = self.IRsensor.Ta()
+                self.Tobj = self.IRsensor.Tobj()
+                isday(True)
+                print("Output of MLX90614: TAmbient = ", self.Ta, "°C / TSky = ", self.Tobj, "°C")
+                #Write data of MLX90614 IR sensor into Homematic
+                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24737,24738&new_value="+"{:.1f},{:.1f}".format(self.Ta, self.Tobj))
+                if r.status_code != requests.codes['ok']:
+                    print("Data could not be written into the Homatic system variables.")
+            except subprocess.TimeoutExpired:
+                print("Waited", self.timeout, "seconds, and did not get any valid data from MLX90614")
+            if self.stopped.wait(self.read_interval):
+                break
+
+def switchpin(pin, state=True):
+    """
+    Switches state of <pin> to >state>
+    """
+    base = "/sys/class/gpio/gpio"+str(pin)
+    if state:
+        if not os.path.isdir(base):
+            f = open("/sys/class/gpio/export", "w")
+            f.write(str(pin))
+            f.close()
+        f = open(base + "/direction", "w")
+        f.write("out")
+        f.close()
+        f = open(base + "/value", "w")
+        f.write("1")
+        f.close()
+    else:
+        if os.path.isdir(base):
+            f = open(base + "/value")
+            f.write("0")
+            f.close()
+            f = open("/sys/class/gpio/unexport")
+            f.write(str(pin))
+            f.close()
+
+def turnonCamera():
+    """
+    Switches 5V USB Power of Camera on
+    """
+    switchpin(35)
+    time.sleep(2) # Wait for 2 seconds to ensure that camera has fully powered up
+
+def turnoffCamera():
+    """
+    Switches 5V USB Power of Camera off
+    """
+    switchpin(35, state=False)
+
+def turnonHeater():
+    """
+    Switches 1V Power of Dew-Heater on
+    """
+    switchpin(33)
+
+def turnoffHeater():
+    """
+    Switches 1V Power of Dew-Heater off
+    """
+    switchpin(33, state=False)
+
+class INA219:
+    """Class containing the INA219 functionality."""
+
+    RANGE_16V = 0  # Range 0-16 volts
+    RANGE_32V = 1  # Range 0-32 volts
+
+    GAIN_1_40MV = 0  # Maximum shunt voltage 40mV
+    GAIN_2_80MV = 1  # Maximum shunt voltage 80mV
+    GAIN_4_160MV = 2  # Maximum shunt voltage 160mV
+    GAIN_8_320MV = 3  # Maximum shunt voltage 320mV
+    GAIN_AUTO = -1  # Determine gain automatically
+
+    ADC_9BIT = 0  # 9-bit conversion time  84us.
+    ADC_10BIT = 1  # 10-bit conversion time 148us.
+    ADC_11BIT = 2  # 11-bit conversion time 2766us.
+    ADC_12BIT = 3  # 12-bit conversion time 532us.
+    ADC_2SAMP = 9  # 2 samples at 12-bit, conversion time 1.06ms.
+    ADC_4SAMP = 10  # 4 samples at 12-bit, conversion time 2.13ms.
+    ADC_8SAMP = 11  # 8 samples at 12-bit, conversion time 4.26ms.
+    ADC_16SAMP = 12  # 16 samples at 12-bit,conversion time 8.51ms
+    ADC_32SAMP = 13  # 32 samples at 12-bit, conversion time 17.02ms.
+    ADC_64SAMP = 14  # 64 samples at 12-bit, conversion time 34.05ms.
+    ADC_128SAMP = 15  # 128 samples at 12-bit, conversion time 68.10ms.
+
+    __ADDRESS = 0x40
+
+    __REG_CONFIG = 0x00
+    __REG_SHUNTVOLTAGE = 0x01
+    __REG_BUSVOLTAGE = 0x02
+    __REG_POWER = 0x03
+    __REG_CURRENT = 0x04
+    __REG_CALIBRATION = 0x05
+
+    __RST = 15
+    __BRNG = 13
+    __PG1 = 12
+    __PG0 = 11
+    __BADC4 = 10
+    __BADC3 = 9
+    __BADC2 = 8
+    __BADC1 = 7
+    __SADC4 = 6
+    __SADC3 = 5
+    __SADC2 = 4
+    __SADC1 = 3
+    __MODE3 = 2
+    __MODE2 = 1
+    __MODE1 = 0
+
+    __OVF = 1
+    __CNVR = 2
+
+    __BUS_RANGE = [16, 32]
+    __GAIN_VOLTS = [0.04, 0.08, 0.16, 0.32]
+
+    __CONT_SH_BUS = 7
+
+    __AMP_ERR_MSG = ('Expected current %.3fA is greater '
+                     'than max possible current %.3fA')
+    __RNG_ERR_MSG = ('Expected amps %.2fA, out of range, use a lower '
+                     'value shunt resistor')
+    __VOLT_ERR_MSG = ('Invalid voltage range, must be one of: '
+                      'RANGE_16V, RANGE_32V')
+
+    __LOG_FORMAT = '%(asctime)s - %(levelname)s - INA219 %(message)s'
+    __LOG_MSG_1 = ('shunt ohms: %.3f, bus max volts: %d, '
+                   'shunt volts max: %.2f%s, '
+                   'bus ADC: %d, shunt ADC: %d')
+    __LOG_MSG_2 = ('calibrate called with: bus max volts: %dV, '
+                   'max shunt volts: %.2fV%s')
+    __LOG_MSG_3 = ('Current overflow detected - '
+                   'attempting to increase gain')
+
+    __SHUNT_MILLIVOLTS_LSB = 0.01  # 10uV
+    __BUS_MILLIVOLTS_LSB = 4  # 4mV
+    __CALIBRATION_FACTOR = 0.04096
+    __MAX_CALIBRATION_VALUE = 0xFFFE  # Max value supported (65534 decimal)
+    # In the spec (p17) the current LSB factor for the minimum LSB is
+    # documented as 32767, but a larger value (100.1% of 32767) is used
+    # to guarantee that current overflow can always be detected.
+    __CURRENT_LSB_FACTOR = 32800
+
+    @staticmethod
+    def _geti2cbusnumber():
+        # Gets the I2C bus number /dev/i2c-#
+        return 2
+
+    def __init__(self, shunt_ohms, max_expected_amps=None,
+                 address=__ADDRESS,
+                 log_level=logging.ERROR, debug=True):
+        """Construct the class.
+        Pass in the resistance of the shunt resistor and the maximum expected
+        current flowing through it in your system.
+        Arguments:
+        shunt_ohms -- value of shunt resistor in Ohms (mandatory).
+        max_expected_amps -- the maximum expected current in Amps (optional).
+        address -- the I2C address of the INA219, defaults
+            to *0x40* (optional).
+        log_level -- set to logging.DEBUG to see detailed calibration
+            calculations (optional).
+        """
+        if not logging.getLogger().handlers:
+            # Initialize the root logger only if it hasn't been done yet by a
+            # parent module.
+            logging.basicConfig(level=log_level, format=self.__LOG_FORMAT)
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(log_level)
+
+        self.address = address
+        self.debug = debug
+        if debug:
+            print("I2C Bus Number: %d" % self._geti2cbusnumber())
+        self.bus = smbus.SMBus(self._geti2cbusnumber())
+        self._shunt_ohms = shunt_ohms
+        self._max_expected_amps = max_expected_amps
+        self._min_device_current_lsb = self._calculate_min_current_lsb()
+        self._gain = None
+        self._auto_gain_enabled = False
+        self._voltage_range = None
+        self._current_lsb = None
+        self._power_lsb = None
+
+    def errmsg(self, error):
+        """
+        prints low level error message if I2C address cannot be accessed
+        """
+        print("Error accessing 0x%02X(%X): Check your I2C address" % (self.address, error))
+        return -1
+
+    # Only writelist, readu16 and reads16 commands
+    # are needed
+    def readu16(self, reg, little_endian=True):
+        "Reads an unsigned 16-bit value from the I2C device"
+        try:
+            result = 0xFFFA
+            while result == 0xFFFA:
+                result = self.bus.read_word_data(self.address, reg) & 0xFFFF
+            # Swap bytes if using big endian because read_word_data assumes little
+            # endian on ARM (little endian) systems.
+            if not little_endian:
+                result = ((result << 8) & 0xFF00) + (result >> 8)
+            if self.debug:
+                print("I2C: Device 0x%02X returned 0x%04X from reg 0x%02X" %
+                      (self.address, result & 0xFFFF, reg))
+            return result
+        except IOError as err:
+            return self.errmsg(err)
+
+    def reads16(self, reg, little_endian=True):
+        "Reads a signed 16-bit value from the I2C device"
+        try:
+            result = self.readu16(reg, little_endian)
+            if result > 32767:
+                result -= 65536
+            return result
+        except IOError as err:
+            return self.errmsg(err)
+
+    def writelist(self, register, data):
+        """Write bytes to the specified register."""
+        self.bus.write_i2c_block_data(self.address, register, data)
+        self.logger.debug("Wrote to register 0x%02X: %s",
+                          register, data)
+
+    def configure(self, voltage_range=RANGE_32V, gain=GAIN_AUTO,
+                  bus_adc=ADC_12BIT, shunt_adc=ADC_12BIT):
+        """Configure and calibrate how the INA219 will take measurements.
+        Arguments:
+        voltage_range -- The full scale voltage range, this is either 16V
+            or 32V represented by one of the following constants;
+            RANGE_16V, RANGE_32V (default).
+        gain -- The gain which controls the maximum range of the shunt
+            voltage represented by one of the following constants;
+            GAIN_1_40MV, GAIN_2_80MV, GAIN_4_160MV,
+            GAIN_8_320MV, GAIN_AUTO (default).
+        bus_adc -- The bus ADC resolution (9, 10, 11, or 12-bit) or
+            set the number of samples used when averaging results
+            represent by one of the following constants; ADC_9BIT,
+            ADC_10BIT, ADC_11BIT, ADC_12BIT (default),
+            ADC_2SAMP, ADC_4SAMP, ADC_8SAMP, ADC_16SAMP,
+            ADC_32SAMP, ADC_64SAMP, ADC_128SAMP
+        shunt_adc -- The shunt ADC resolution (9, 10, 11, or 12-bit) or
+            set the number of samples used when averaging results
+            represent by one of the following constants; ADC_9BIT,
+            ADC_10BIT, ADC_11BIT, ADC_12BIT (default),
+            ADC_2SAMP, ADC_4SAMP, ADC_8SAMP, ADC_16SAMP,
+            ADC_32SAMP, ADC_64SAMP, ADC_128SAMP
+        """
+        self.__validate_voltage_range(voltage_range)
+        self._voltage_range = voltage_range
+
+        if self._max_expected_amps is not None:
+            if gain == self.GAIN_AUTO:
+                self._auto_gain_enabled = True
+                self._gain = self._determine_gain(self._max_expected_amps)
+            else:
+                self._gain = gain
+        else:
+            if gain != self.GAIN_AUTO:
+                self._gain = gain
+            else:
+                self._auto_gain_enabled = True
+                self._gain = self.GAIN_1_40MV
+
+        self.logger.info('gain set to %.2fV', self.__GAIN_VOLTS[self._gain])
+
+        self.logger.debug(
+            self.__LOG_MSG_1,
+            (self._shunt_ohms, self.__BUS_RANGE[voltage_range],
+             self.__GAIN_VOLTS[self._gain],
+             self.__max_expected_amps_to_string(self._max_expected_amps),
+             bus_adc, shunt_adc))
+
+        self._calibrate(
+            self.__BUS_RANGE[voltage_range], self.__GAIN_VOLTS[self._gain],
+            self._max_expected_amps)
+        self._configure(voltage_range, self._gain, bus_adc, shunt_adc)
+
+    def voltage(self):
+        """Return the bus voltage in volts."""
+        value = self._voltage_register()
+        return float(value) * self.__BUS_MILLIVOLTS_LSB / 1000
+
+    def supply_voltage(self):
+        """Return the bus supply voltage in volts.
+        This is the sum of the bus voltage and shunt voltage. A
+        DeviceRangeError exception is thrown if current overflow occurs.
+        """
+        return self.voltage() + (float(self.shunt_voltage()) / 1000)
+
+    def current(self):
+        """Return the bus current in milliamps.
+        A DeviceRangeError exception is thrown if current overflow occurs.
+        """
+        self._handle_current_overflow()
+        return self._current_register() * self._current_lsb * 1000
+
+    def power(self):
+        """Return the bus power consumption in milliwatts.
+        A DeviceRangeError exception is thrown if current overflow occurs.
+        """
+        self._handle_current_overflow()
+        return self._power_register() * self._power_lsb * 1000
+
+    def shunt_voltage(self):
+        """Return the shunt voltage in millivolts.
+        A DeviceRangeError exception is thrown if current overflow occurs.
+        """
+        self._handle_current_overflow()
+        return self._shunt_voltage_register() * self.__SHUNT_MILLIVOLTS_LSB
+
+    def sleep(self):
+        """Put the INA219 into power down mode."""
+        configuration = self._read_configuration()
+        self._configuration_register(configuration & 0xFFF8)
+
+    def wake(self):
+        """Wake the INA219 from power down mode."""
+        configuration = self._read_configuration()
+        self._configuration_register(configuration | 0x0007)
+        # 40us delay to recover from powerdown (p14 of spec)
+        time.sleep(0.00004)
+
+    def current_overflow(self):
+        """Return true if the sensor has detect current overflow.
+        In this case the current and power values are invalid.
+        """
+        return self._has_current_overflow()
+
+    def reset(self):
+        """Reset the INA219 to its default configuration."""
+        self._configuration_register(1 << self.__RST)
+
+    def _handle_current_overflow(self):
+        if self._auto_gain_enabled:
+            while self._has_current_overflow():
+                self._increase_gain()
+        else:
+            if self._has_current_overflow():
+                raise DeviceRangeError(self.__GAIN_VOLTS[self._gain])
+
+    def _determine_gain(self, max_expected_amps):
+        shunt_v = max_expected_amps * self._shunt_ohms
+        if shunt_v > self.__GAIN_VOLTS[3]:
+            raise ValueError(self.__RNG_ERR_MSG % max_expected_amps)
+        gain = min(v for v in self.__GAIN_VOLTS if v > shunt_v)
+        return self.__GAIN_VOLTS.index(gain)
+
+    def _increase_gain(self):
+        self.logger.info(self.__LOG_MSG_3)
+        gain = self._read_gain()
+        if gain < len(self.__GAIN_VOLTS) - 1:
+            gain = gain + 1
+            self._calibrate(self.__BUS_RANGE[self._voltage_range],
+                            self.__GAIN_VOLTS[gain])
+            self._configure_gain(gain)
+            # 1ms delay required for new configuration to take effect,
+            # otherwise invalid current/power readings can occur.
+            time.sleep(0.001)
+        else:
+            self.logger.info('Device limit reach, gain cannot be increased')
+            raise DeviceRangeError(self.__GAIN_VOLTS[gain], True)
+
+    def _configure(self, voltage_range, gain, bus_adc, shunt_adc):
+        configuration = (
+            voltage_range << self.__BRNG | gain << self.__PG0 |
+            bus_adc << self.__BADC1 | shunt_adc << self.__SADC1 |
+            self.__CONT_SH_BUS)
+        self._configuration_register(configuration)
+
+    def _calibrate(self, bus_volts_max, shunt_volts_max,
+                   max_expected_amps=None):
+        self.logger.info(
+            self.__LOG_MSG_2,
+            (bus_volts_max, shunt_volts_max,
+             self.__max_expected_amps_to_string(max_expected_amps)))
+
+        max_possible_amps = shunt_volts_max / self._shunt_ohms
+
+        self.logger.info("max possible current: %.3fA",
+                         max_possible_amps)
+
+        self._current_lsb = \
+            self._determine_current_lsb(max_expected_amps, max_possible_amps)
+        self.logger.info("current LSB: %.3e A/bit", self._current_lsb)
+
+        self._power_lsb = self._current_lsb * 20
+        self.logger.info("power LSB: %.3e W/bit", self._power_lsb)
+
+        max_current = self._current_lsb * 32767
+        self.logger.info("max current before overflow: %.4fA", max_current)
+
+        max_shunt_voltage = max_current * self._shunt_ohms
+        self.logger.info("max shunt voltage before overflow: %.4fmV",
+                         (max_shunt_voltage * 1000))
+
+        calibration = math.trunc(self.__CALIBRATION_FACTOR /
+                                 (self._current_lsb * self._shunt_ohms))
+        self.logger.info(
+            "calibration: 0x%04x (%d)", calibration, calibration)
+        self._calibration_register(calibration)
+
+    def _determine_current_lsb(self, max_expected_amps, max_possible_amps):
+        if max_expected_amps is not None:
+            if max_expected_amps > round(max_possible_amps, 3):
+                raise ValueError(self.__AMP_ERR_MSG %
+                                 (max_expected_amps, max_possible_amps))
+            self.logger.info("max expected current: %.3fA",
+                             max_expected_amps)
+            if max_expected_amps < max_possible_amps:
+                current_lsb = max_expected_amps / self.__CURRENT_LSB_FACTOR
+            else:
+                current_lsb = max_possible_amps / self.__CURRENT_LSB_FACTOR
+        else:
+            current_lsb = max_possible_amps / self.__CURRENT_LSB_FACTOR
+
+        if current_lsb < self._min_device_current_lsb:
+            current_lsb = self._min_device_current_lsb
+        return current_lsb
+
+    def _configuration_register(self, register_value):
+        self.logger.debug("configuration: 0x%04x", register_value)
+        self.__write_register(self.__REG_CONFIG, register_value)
+
+    def _read_configuration(self):
+        return self.__read_register(self.__REG_CONFIG)
+
+    def _calculate_min_current_lsb(self):
+        return self.__CALIBRATION_FACTOR / \
+            (self._shunt_ohms * self.__MAX_CALIBRATION_VALUE)
+
+    def _read_gain(self):
+        configuration = self._read_configuration()
+        gain = (configuration & 0x1800) >> self.__PG0
+        self.logger.info("gain is currently: %.2fV", self.__GAIN_VOLTS[gain])
+        return gain
+
+    def _configure_gain(self, gain):
+        configuration = self._read_configuration()
+        configuration = configuration & 0xE7FF
+        self._configuration_register(configuration | (gain << self.__PG0))
+        self._gain = gain
+        self.logger.info("gain set to: %.2fV", self.__GAIN_VOLTS[gain])
+
+    def _calibration_register(self, register_value):
+        self.logger.debug("calibration: 0x%04x", register_value)
+        self.__write_register(self.__REG_CALIBRATION, register_value)
+
+    def _has_current_overflow(self):
+        ovf = self._read_voltage_register() & self.__OVF
+        return ovf == 1
+
+    def _voltage_register(self):
+        register_value = self._read_voltage_register()
+        return register_value >> 3
+
+    def _read_voltage_register(self):
+        return self.__read_register(self.__REG_BUSVOLTAGE)
+
+    def _current_register(self):
+        return self.__read_register(self.__REG_CURRENT, True)
+
+    def _shunt_voltage_register(self):
+        return self.__read_register(self.__REG_SHUNTVOLTAGE, True)
+
+    def _power_register(self):
+        return self.__read_register(self.__REG_POWER)
+
+    def __validate_voltage_range(self, voltage_range):
+        if voltage_range > len(self.__BUS_RANGE) - 1:
+            raise ValueError(self.__VOLT_ERR_MSG)
+
+    def __write_register(self, register, register_value):
+        register_bytes = self.__to_bytes(register_value)
+        self.logger.debug(
+            "write register 0x%02x: 0x%04x 0b%s", register, register_value,
+            self.__binary_as_string(register_value))
+        self.writelist(register, register_bytes)
+
+    def __read_register(self, register, negative_value_supported=False):
+        if negative_value_supported:
+            register_value = self.reads16(register, little_endian=False)
+        else:
+            register_value = self.readu16(register, little_endian=False)
+        self.logger.debug(
+            "read register 0x%02x: 0x%04x 0b%s", register, register_value,
+            self.__binary_as_string(register_value))
+        return register_value
+
+    @staticmethod
+    def __to_bytes(register_value):
+        return [(register_value >> 8) & 0xFF, register_value & 0xFF]
+
+    @staticmethod
+    def __binary_as_string(register_value):
+        return bin(register_value)[2:].zfill(16)
+
+    @staticmethod
+    def __max_expected_amps_to_string(max_expected_amps):
+        if max_expected_amps is None:
+            return ''
+        return ', max expected amps: %.3fA' % max_expected_amps
+
+
+class DeviceRangeError(Exception):
+    """Class containing the INA219 error functionality."""
+
+    __DEV_RNG_ERR = ('Current out of range (overflow), '
+                     'for gain %.2fV')
+
+    def __init__(self, gain_volts, device_max=False):
+        """Construct a DeviceRangeError."""
+        msg = self.__DEV_RNG_ERR % gain_volts
+        if device_max:
+            msg = msg + ', device limit reached'
+        super(DeviceRangeError, self).__init__(msg)
+        self.gain_volts = gain_volts
+        self.device_limit_reached = device_max
+
+class CurrentSensorThread(threading.Thread):
+    """
+    thread for reading MLX90614 IR Sensor
+    """
+    def __init__(self, event, camera, read_interval=None, timeout=None):
+        threading.Thread.__init__(self)
+        if read_interval is None:
+            self.read_interval = 5 * 60
+        else:
+            self.read_interval = read_interval
+        if timeout is None:
+            self.timeout = 5.0
+        else:
+            self.timeout = timeout
+        self.stopped = event
+        self.camera = camera
+        self._shunt_ohms = 0.1
+        self._max_expected_amps = 2.0
+        self._currentsensor = INA219(self._shunt_ohms, max_expected_amps=self._max_expected_amps, debug=False)
+        self._currentsensor.configure(self._currentsensor.RANGE_16V)
+        self.voltage = None
+        self.current = None
+        self.power = None
+        self.shunt_voltage = None
+
+    def run(self):
+        while True:
+            try:
+                try:
+                    #Read data of INA219 sensor
+                    self.voltage = self._currentsensor.voltage()
+                    self.current = self._currentsensor.current()
+                    self.power = self._currentsensor.power()
+                    self.shunt_voltage = self._currentsensor.shunt_voltage()
+                except DeviceRangeError as err:
+                    # Current out of device range with specified shunt resistor
+                    print(err)
+                    break
+
+                isday(True)
+                print("Output of INA219: Bus Voltage  : %.3f V" % self.voltage)
+                print("                  Bus Current  : %.3f mA" % self.current)
+                print("                  Bus Power    : %.3f mW" % self.power)
+                print("                  Shunt Voltage: %.3f mV" % self.shunt_voltage)
+                #Write data of INA219 sensor into Homematic
+                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24742,24743,24744,24745&new_value="+"{:.3f},{:.3f},{:.3f},{:.3f}".format(self.voltage, self.current, self.power, self.shunt_voltage))
+                if r.status_code != requests.codes['ok']:
+                    print("Data could not be written into the Homatic system variables.")
+            except subprocess.TimeoutExpired:
+                print("Waited", self.timeout, "seconds, and did not get any valid data from MLX90614")
             if self.stopped.wait(self.read_interval):
                 break
 
@@ -466,7 +1178,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
         imgs.append(img)
 
     print("Analemma HDR frame capture finished.")
-    
+
     print('File Extension is %s' % args.extension.upper())
 
     # write image based on extension specification and data compression parameters
@@ -485,9 +1197,9 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
         elif args.extension == 'fits':
             # use astropy to write FITS image
             if (args.channels == 1) and not dodebayer:
-                hdu = fits.PrimaryHDU(data=img[:,:,0])
+                hdu = fits.PrimaryHDU(data=img[:, :, 0])
             else:
-                hdu = fits.PrimaryHDU(data=[img[:,:,0], img[:,:,1], img[:,:,2]])
+                hdu = fits.PrimaryHDU(data=[img[:, :, 0], img[:, :, 1], img[:, :, 2]])
             hdu.writeto(filebase + '.fits')
 
 
@@ -597,6 +1309,45 @@ def is_number(s):
         pass
 
     return False
+
+def _stamptext(img, caption, lasty, args, left=True, top=True):
+    """
+    renders the string <caption> on the image <img> under the last line at
+    position lasty (bottommost y-position for top=True and topmost y-position
+    for top=False) with the font parameters given in args. left and top specify
+    the four corners of the image for the caption lines (e.g. left=False,
+    top=True is the top right corner as a start point).
+    The line margins are taken from the args.textx parameter.
+    Depending on the value of args.ftfont the built in font Herhey of
+    version <args.fontname> is taken (if args.ftfont equals None) or a loaded
+    ttf font is used.
+    """
+    if args.ftfont is None:
+        (textboxwidth, textboxheight), baseline = cv2.getTextSize(caption, args.fontname, args.fontscale, args.fontlinethick)
+    else:
+        (textboxwidth, textboxheight), baseline = args.ftfont.getTextSize(caption, int(8*args.fontscale), args.fontlinethick)
+
+    if left:
+        textx = args.textx
+    else:
+        textx = args.width - args.textx - textboxwidth
+    if top:
+        texty = lasty + args.texty + textboxheight
+        lasty = texty + baseline
+    else:
+        texty = lasty - args.texty - baseline
+        lasty = texty - textboxheight
+    if args.ftfont is None:
+        cv2.putText(img, caption, (textx, texty), args.fontname, \
+                    args.fontscale, args.fontcolor, args.fontlinethick, \
+                    lineType=args.fontlinetype)
+    else:
+        args.ftfont.putText(img=img, text=caption, org=(textx, texty), \
+           fontHeight=int(8*args.fontscale), color=args.fontcolor, \
+           thickness=args.fontlinethick, line_type=args.fontlinetype, \
+           bottomLeftOrigin=True)
+    return lasty
+
 
 parser = argparse.ArgumentParser(description='Process and save images from the AllSkyCamera')
 
@@ -789,23 +1540,36 @@ parser.add_argument('--takedarkframe',
 # Overlay text
 parser.add_argument('--text',
                     default='',
-                    help='Character/Text Overlay. Use quotes e.g. "Text". Positioned at <textX>,\
-                    <textY> with the properties given by the <font...> parameters. (Default "")')
+                    help='Character/text overlay caption. Use quotes e.g. "Text". \
+                    Top left corner of this text is positioned at <textx>, <texty>. \
+                    <textx> is used as margin between the lines of text as well. \
+                    The font properties are given by the <font...> parameters. \
+                    If this parameter is specified together with the --time \
+                    parameter then the time is given after this text in brackets.\
+                    (Default "")')
 # Overlay text x position
 parser.add_argument('--textx',
-                    default=15,
+                    default=5,
                     type=check_positive_int,
-                    help='Text placement horizontal from left in pixels (Default 15)')
+                    help='x-boundary of distance between text boxes of captions and image frame (Default 5)')
 # Overlay text y position
 parser.add_argument('--texty',
-                    default=25,
+                    default=5,
                     type=check_positive_int,
-                    help='Text placement vertical from top in pixels (Default 25)')
+                    help='y-boundary of distance between text boxes of captions and image frame (Default 5)')
 # Name of font
 parser.add_argument('--fontname',
                     default=0,
-                    choices=range(7),
-                    help='Font type number (0-7 ex. 0:simplex/4:triplex/7:script, default 0)')
+                    help='Font type number (0-7 ex. 0:simplex/4:triplex/7:script, default 0) \
+                    or TTF font name (e.g. ubuntu/Ubuntu-R.ttf')
+# Base directory for ttf fonts
+parser.add_argument('--fontbase',
+                    nargs='?',
+                    const='/usr/share/fonts/truetype/',
+                    default='/usr/share/fonts/truetype/',
+                    help='Path to true type font directory. Any subdirectory of this \
+                    path must be specified together with the ttf name in --fontname \
+                    parameter (Default /usr/share/fonts/truetype/)')
 # Color of font
 parser.add_argument('--fontcolor',
                     default=[1.0, 0.0, 0.0],
@@ -818,10 +1582,10 @@ parser.add_argument('--fontlinetype',
                     choices=range(2),
                     help='Font line type (0:AA/1:8/2:4, default 0)')
 # Size of font
-parser.add_argument('--fontsize',
+parser.add_argument('--fontscale',
                     default=1.0,
                     type=float,
-                    help='Font size (default 1.0)')
+                    help='Font scale factor that is multiplied with the font-specific base size. (default 1.0)')
 # Line type of font
 parser.add_argument('--fontlinethick',
                     default=2,
@@ -843,6 +1607,11 @@ parser.add_argument('--daytime',
 parser.add_argument('--details',
                     action='store_true',
                     help='Show additional metadata in image')
+# Metadata labeling scale relative to caption
+parser.add_argument('--detailscale',
+                    default=0.8,
+                    type=float,
+                    help='Scale by which the additional metadata is smaller than the text caption')
 # Debayer Algorithm (only for RAW image processing
 parser.add_argument('--debayeralg',
                     default='none',
@@ -972,6 +1741,14 @@ else:
     print('Wrong --debayeralg argument. Should read none, bilinear/bl, \
     variablenumberofgradients/vng or edgeaware/ea')
     exit()
+if isinstance(args.fontname, str):
+    print('Font: %s specified' % args.fontname)
+    args.ftfont = cv2.freetype.createFreeType2()
+    args.ftfont.loadFontData(fontFileName=args.fontbase + args.fontname, id=0)
+else:
+    args.ftfont = None
+    print('Builtin Hershey Font # %d specified' % args.fontname)
+    args.fontname = int(args.fontname)
 position = ephem.Observer()
 position.pressure = 0
 position.lon = args.lon * math.pi / 180
@@ -979,6 +1756,9 @@ position.lat = args.lat * math.pi / 180
 isday = IsDay(position)
 
 print("Position: Lat: %s / Lon: %s" % (position.lat, position.lon))
+
+# Switch camera on if not already on
+turnonCamera()
 
 if not os.path.isfile(args.ASIlib):
     print('The filename of the SDK library "' + args.ASIlib +'" has not been found.')
@@ -1062,7 +1842,7 @@ else:
     args.top //= args.bin
 args.textx //= args.bin
 args.texty //= args.bin
-args.fontsize /= args.bin
+args.fontscale /= args.bin
 args.fontlinethick //= args.bin
 
 print('Selected Image dimensions: %s,%s (binning %d)' % (args.width, args.height, args.bin))
@@ -1160,8 +1940,8 @@ else:
     focuscounter = -1
 
 # split arguments for metadata target specification
-    
-if args.metadata != None:
+
+if args.metadata is not None:
     args.metadata = args.metadata.split(',')
 
 #Start Temperature and Humidity-Monitoring with DHT22 sensor. Read out every 5min (300sec) and timeout after 10sec
@@ -1171,6 +1951,19 @@ dht22thread = dht22Thread(dht22stopFlag, camera, 300, 10)
 dht22thread.start()
 threads.append(dht22thread)
 
+#Start IR Temperature Monitoring with MLX90614 sensor. Read out every 5min (300sec) and timeout after 10sec
+
+IRSensorstopFlag = threading.Event()
+IRSensorthread = IRSensorThread(IRSensorstopFlag, camera, 300, 10)
+IRSensorthread.start()
+threads.append(IRSensorthread)
+
+#Initialize INA219 Current Sensor with the default parameters
+
+CurrentSensorstopFlag = threading.Event()
+CurrentSensorthread = CurrentSensorThread(CurrentSensorstopFlag, camera, 300, 10)
+CurrentSensorthread.start()
+threads.append(CurrentSensorthread)
 
 if args.analemma != '':
     # initialize scheduler with UTC time
@@ -1329,52 +2122,56 @@ while bMain:
                         print("==>Memory after masking: %s percent. " % psutil.virtual_memory()[2])
 
                 # If time parameter is specified, print timestring
-                if args.time:
-                    args.text = timestring.strftime("%d.%b.%Y %X")
-                print('Caption: %s'%args.text)
+                #(in brackets if text parameter is given as well)
+                caption = args.text
+                if args.time and args.text != "":
+                    caption = caption + "(" + timestring.strftime("%d.%b.%Y %X") + ")"
+                elif args.time:
+                    caption = timestring.strftime("%d.%b.%Y %X")
+                print('Caption: %s' % caption)
                 if args.debug:
                     print('Takedarkframe:', args.takedarkframe == '')
                 if args.takedarkframe == '':
                     if args.debug:
                         print('Writing image caption')
-                    cv2.putText(img, str(args.text), (args.textx, args.texty), args.fontname, \
-                                args.fontsize, args.fontcolor, args.fontlinethick, \
-                                lineType=args.fontlinetype)
+                    lasty = _stamptext(img, caption, 0, args)
                     if args.details:
-                        line = str('Sensor {:.1f}degC'.\
-                                 format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
-                        cv2.putText(img, line, (args.textx, int(args.texty+30/args.bin)), \
-                                    args.fontname, args.fontsize*0.8, args.fontcolor, \
-                                    args.fontlinethick, lineType=args.fontlinetype)
+                        #Output into to left corner of the image underneath the Date-Time Caption
+                        dargs = copy.deepcopy(args)
+                        dargs.fontscale = args.fontscale*0.8
+                        caption = str('Sensor {:.1f}degC'.\
+                                      format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
+                        lasty = _stamptext(img, caption, lasty, dargs)
                         if lastisday and autoExp < 1000000:
-                            line = 'Exposure {:.3f} ms'.format(autoExp/1000)
+                            caption = 'Exposure {:.3f} ms'.format(autoExp/1000)
                         else:
-                            line = 'Exposure {:.3f} s'.format(autoExp/1000000)
-                        cv2.putText(img, line, (args.textx, int(args.texty+60/args.bin)), \
-                                    args.fontname, args.fontsize*0.8, args.fontcolor, \
-                                    args.fontlinethick, lineType=args.fontlinetype)
-                        line = str('Gain {:d}'.format(autoGain))
-                        cv2.putText(img, line, (args.textx, int(args.texty+90/args.bin)), \
-                                    args.fontname, args.fontsize*0.8, args.fontcolor,  \
-                                    args.fontlinethick, lineType=args.fontlinetype)
-                        line = str('Housing Temp. {:.1f}degC'.\
-                                 format(dht22thread.dht22temp))
-                        cv2.putText(img, line, (args.textx, int(args.texty+120/args.bin)), \
-                                    args.fontname, args.fontsize*0.8, args.fontcolor, \
-                                    args.fontlinethick, lineType=args.fontlinetype)
-                        line = str('Housing Hum. {:.1f}%'.\
-                                 format(dht22thread.dht22hum))
-                        cv2.putText(img, line, (args.textx, int(args.texty+150/args.bin)), \
-                                    args.fontname, args.fontsize*0.8, args.fontcolor, \
-                                    args.fontlinethick, lineType=args.fontlinetype)
-                        line = str('Dew Point {:.1f}degC'.\
+                            caption = 'Exposure {:.3f} s'.format(autoExp/1000000)
+                        lasty = _stamptext(img, caption, lasty, dargs)
+                        caption = str('Gain {:d}'.format(autoGain))
+                        lasty = _stamptext(img, caption, lasty, dargs)
+                        #Output into the bottom left corner of the image
+                        caption = str('Dew Point {:.1f}degC'.\
                                  format(dht22thread.dewpoint))
-                        cv2.putText(img, line, (args.textx, int(args.texty+180/args.bin)), \
-                                    args.fontname, args.fontsize*0.8, args.fontcolor, \
-                                    args.fontlinethick, lineType=args.fontlinetype)
+                        lasty = _stamptext(img, caption, dargs.height, dargs, top=False)
+                        caption = str('Housing Hum. {:.1f}%'.\
+                                 format(dht22thread.dht22hum))
+                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                        caption = str('Housing Temp. {:.1f}degC'.\
+                                 format(dht22thread.dht22temp))
+                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                        caption = str('IR Amb. Temp. {:.1f}degC'.\
+                                 format(IRSensorthread.Ta))
+                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                        caption = str('Sky Temp. {:.1f}degC'.\
+                                 format(IRSensorthread.Tobj))
+                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                        #Output into the top right corner of the image
+                        caption = str('Bus Power {:.3f}mW'.\
+                                 format(CurrentSensorthread.power))
+                        lasty = _stamptext(img, caption, 0, dargs, left=False, top=True)
                 # save control values of camera and
-		        # do some simple statistics on image and save to associated text file with the camera settings
-                if args.metadata != None:
+                # do some simple statistics on image and save to associated text file with the camera settings
+                if args.metadata is not None:
                     camctrls = camera.get_control_values()
                     imgstats = get_image_statistics(img)
                     if 'txt' in args.metadata:
@@ -1450,6 +2247,8 @@ img = None
 imgarray = None
 imgbay = None
 dht22stopFlag.set()
+IRSensorstopFlag.set()
+CurrentSensorstopFlag.set()
 
 # Finally wait for all threads to complete
 if args.analemma != '':
