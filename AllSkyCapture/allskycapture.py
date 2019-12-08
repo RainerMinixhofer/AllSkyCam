@@ -124,11 +124,17 @@ def postprocess(args):
             vid = cv2.VideoWriter(vidfile, cv2.VideoWriter_fourcc(*'mp4v'), \
                                   args.framerate, (args.width, args.height))
         for idx, imgfile in enumerate(imgfiles):
-            image = cv2.imread(imgfile)
+            try:
+                image = cv2.imread(imgfile)
+                # Sometimes there is no error thrown by imread, but the img is still corrupted. This then
+                # shows up when taking statistics
+                imgstats = get_image_statistics(image)
+            except:
+                print("Error in readin image %s. Skipping to next file" % imgfile)
+                continue
             if dovideo:
                 vid.write(image)
             if dostart:
-                imgstats = get_image_statistics(image)
                 mean = imgstats['Mean']
                 # Save mean and standard deviation in statistics array
                 stats[idx] = [mean, imgstats['StdDev'], imgstats['Focus']]
@@ -299,6 +305,8 @@ class dht22Thread(threading.Thread):
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22278&new_value="+"{:.1f}".format(self.dewpoint))
                 if r.status_code != requests.codes['ok']:
                     print("Data could not be written into the Homematic system variables.")
+                self.pressure = self.pressure.magnitude
+                self.temperature = self.temperature.magnitude
             except subprocess.TimeoutExpired:
                 print("Waited", self.timeout, "seconds, and did not get any valid data from DHT22")
             if self.stopped.wait(self.read_interval):
@@ -358,6 +366,8 @@ class WeatherThread(threading.Thread):
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24771&new_value="+"{:.1f}".format(self.dewpoint))
                 if r.status_code != requests.codes['ok']:
                     print("External Dew Point Data could not be written into the Homatic system variables.")
+                self.pressure = self.pressure.magnitude
+                self.temperature = self.temperature.magnitude
             except subprocess.TimeoutExpired:
                 print("Waited", self.timeout, "seconds, and did not get any valid data from Homematic")
             if self.stopped.wait(self.read_interval):
@@ -512,7 +522,7 @@ class IRSensorThread(threading.Thread):
 
 def switchpin(pin, state=True):
     """
-    Switches state of <pin> to >state>
+    Switches state of <pin> to <state>
     """
     base = "/sys/class/gpio/gpio"+str(pin)
     if state:
@@ -520,6 +530,8 @@ def switchpin(pin, state=True):
             f = open("/sys/class/gpio/export", "w")
             f.write(str(pin))
             f.close()
+        # give kernel time to create control files
+        time.sleep(0.1)
         f = open(base + "/direction", "w")
         f.write("out")
         f.close()
@@ -528,12 +540,38 @@ def switchpin(pin, state=True):
         f.close()
     else:
         if os.path.isdir(base):
-            f = open(base + "/value")
+            f = open(base + "/value", "w")
             f.write("0")
             f.close()
-            f = open("/sys/class/gpio/unexport")
+            f = open("/sys/class/gpio/unexport", "w")
             f.write(str(pin))
             f.close()
+
+def pinstatus(pin):
+    """
+    Returns True if Pin is on and False if Pin is off
+    """
+
+    base = "/sys/class/gpio/gpio"+str(pin)
+    if not os.path.isdir(base):
+        return False
+    f = open(base + "/value", "r")
+    data = f.read()
+    f.close()
+    return data == "1\n"
+
+
+def pinisinput(pin):
+    """
+    Returns True if Pin is input and False if pin is output
+    """
+    base = "/sys/class/gpio/gpio"+str(pin)
+    if not os.path.isdir(base):
+        return True
+    f = open(base + "/direction", "r")
+    data = f.read()
+    f.close()
+    return data == "in\n"
 
 def turnonCamera():
     """
@@ -548,6 +586,12 @@ def turnoffCamera():
     """
     switchpin(35, state=False)
 
+def cameraon():
+    """
+    Returns True if camera is on and False if it is off
+    """
+    return not pinisinput(35) and pinstatus(35)
+
 def turnonHeater():
     """
     Switches 1V Power of Dew-Heater on
@@ -559,6 +603,49 @@ def turnoffHeater():
     Switches 1V Power of Dew-Heater off
     """
     switchpin(33, state=False)
+
+def heateron():
+    """
+    Returns True if dew heater is on and False if it is off
+    """
+    return not pinisinput(33) and pinstatus(33)
+
+def heaterControl(tambient, tdewpoint, sensitivity=1.0, hysteresis=0.2):
+    """
+    Switches Dew Heater on and off depending on difference between the ambient
+    temperature <tambient> and the dew point <tdewpoint>. The default difference
+    is given by sensitivity. Thus the heater switches on at
+    tambient - tdewpoint < sensitivity
+    and off at
+    tambient - tdewpoint > sensitivity + hysteresis
+
+    Parameters
+    ----------
+    sensitivity : TYPE, optional
+        Difference between ambient temperature and dew point
+        when the heater turns on. The default is 1.0 degC.
+    hysteresis : TYPE, optional
+        Hyseresis of two point control of heater. The default is 0.2 degC.
+
+    Returns
+    -------
+    None.
+
+    """
+
+    if not heateron() and tambient - tdewpoint < sensitivity:
+        turnonHeater()
+        #Write data of MLX90614 IR sensor into Homematic
+        r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=1")
+        if r.status_code != requests.codes['ok']:
+            print("Data could not be written into the Homatic system variable.")
+        print("Dew Heater turned on")
+    elif heateron() and tambient - tdewpoint > sensitivity + hysteresis:
+        turnoffHeater()
+        r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=0")
+        if r.status_code != requests.codes['ok']:
+            print("Data could not be written into the Homatic system variable.")
+        print("Dew Heater turned off")
 
 class INA219:
     """Class containing the INA219 functionality."""
@@ -1689,7 +1776,8 @@ parser.add_argument('--debug',
 # Do only postprocessing (video, startrails and keogram) and no image capture
 parser.add_argument('--postprocessonly',
                     action='store_true',
-                    help='Do only postprocessing (video, startrails and keogram) but no image capture.')
+                    help='Do only postprocessing (video, startrails and keogram) but no image capture. \
+                        You have to be in the image directory of the respective day to work.')
 parser.add_argument('--serverrepo',
                     default='/mnt/MultimediaAllSkyCam',
                     help='''Position and username of repository to store Imagery and Videos. \
@@ -2079,6 +2167,8 @@ while bMain:
 #                    raise Exception("Creation of the allskycam subdirectory %s failed" % \
 #                                    args.dirtime_12h_ago)
 
+            # Check if there are more than <args.nightstokeep> directories under images
+            # if so remove the older ones until <args.nightstokeep>-1 remain and create new one
             nightlist = sorted(glob.glob(args.dirname + "/images/" + ('[0-9]' * 8)))
             if args.nightstokeep > 0 and len(nightlist) > args.nightstokeep:
                 for dirpath in nightlist[:-args.nightstokeep]:
@@ -2123,6 +2213,11 @@ while bMain:
 
             while bMain and lastisday == isday(False):
 
+                # Check dew heater control parameters and decide if it needs
+                # to be switched on or off depending on the ambient temperature
+                # and the calculated dew-point
+                if not isday(False):
+                    heaterControl(weatherthread.temperature, weatherthread.dewpoint, sensitivity=1.0, hysteresis=0.2)
                 # read image as bytearray from camera
                 print("Starting Exposure")
 
@@ -2222,7 +2317,7 @@ while bMain:
                         caption = str('External Hum. {:.1f}%'.\
                                  format(weatherthread.humidity))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('External Temp. {:.1f}'.\
+                        caption = str('External Temp. {:.1f}degC'.\
                                  format(weatherthread.temperature))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         caption = str('IR Amb. Temp. {:.1f}degC'.\
