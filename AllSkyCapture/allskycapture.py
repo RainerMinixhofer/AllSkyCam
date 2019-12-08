@@ -283,11 +283,11 @@ class dht22Thread(threading.Thread):
                 #Write data of DHT22 sensor into Homematic
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22276,22275&new_value="+"{:.1f},{:.1f}".format(self.dht22hum, self.dht22temp))
                 if r.status_code != requests.codes['ok']:
-                    print("Data could not be written into the Homatic system variables.")
+                    print("Data could not be written into the Homematic system variables.")
                 #Write Camera Sensor Temperature into Homematic
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22277&new_value="+"{:.1f}".format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
                 if r.status_code != requests.codes['ok']:
-                    print("Data could not be written into the Homatic system variables.")
+                    print("Data could not be written into the Homematic system variables.")
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
                 self.pressure = units.Quantity(float(re.split('\=| ', r.text)[12][1:-1]), 'hPa')
@@ -298,9 +298,68 @@ class dht22Thread(threading.Thread):
                 self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, self.temperature, self.pressure).magnitude
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22278&new_value="+"{:.1f}".format(self.dewpoint))
                 if r.status_code != requests.codes['ok']:
-                    print("Data could not be written into the Homatic system variables.")
+                    print("Data could not be written into the Homematic system variables.")
             except subprocess.TimeoutExpired:
                 print("Waited", self.timeout, "seconds, and did not get any valid data from DHT22")
+            if self.stopped.wait(self.read_interval):
+                break
+
+class WeatherThread(threading.Thread):
+    """
+    thread for reading Weather data from Homematic and timeout (given by timeout) if no readout within read interval (given by read_interval in seconds)
+    """
+    def __init__(self, event, camera, read_interval=None, timeout=None):
+        threading.Thread.__init__(self)
+        if read_interval is None:
+            self.read_interval = 5 * 60
+        else:
+            self.read_interval = read_interval
+        if timeout is None:
+            self.timeout = 5.0
+        else:
+            self.timeout = timeout
+        self.stopped = event
+        self.camera = camera
+        self.humidity = 0
+        self.intensity = 0
+        self.temperature = 0
+        self.mixratio = 0
+        self.specific_humidity = 0
+        self.pressure = 0
+        self.dewpoint = 0
+    def run(self):
+        while True:
+            try:
+                #Read data of Homematic sensor
+                #Read Temperature at Roof
+                r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12378")
+                if r.status_code != requests.codes['ok']:
+                    print("Roof Temperature Data could not be read from the Homematic system.")
+                self.temperature = units.Quantity(float(re.split('=|/|\'', r.text)[-4]), 'degC')
+                #Read Humidity at Roof
+                r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12380")
+                if r.status_code != requests.codes['ok']:
+                    print("Roof Humidity Data could not be read from the Homematic system.")
+                self.humidity = float(re.split('=|/|\'', r.text)[-4])
+                #Read Light Intensity at Roof
+                r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12382")
+                if r.status_code != requests.codes['ok']:
+                    print("Roof Light Intensity Data could not be read from the Homematic system.")
+                self.intensity = float(re.split('=|/|\'', r.text)[-4])
+                isday(True)
+                print("Conditions at Roof: Temperature = ", self.temperature, "°C / Humidity = ", self.humidity, "% / Light Intensity = ", self.intensity)
+                #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
+                r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
+                self.pressure = units.Quantity(float(re.split('\=| ', r.text)[12][1:-1]), 'hPa')
+                #Calculate dewpoint from relative humidity, pressure and temperature using metpy and write it into Homematic
+                self.mixratio = mcalc.mixing_ratio_from_relative_humidity(float(self.humidity)/100, self.temperature, self.pressure)
+                self.specific_humidity = mcalc.specific_humidity_from_mixing_ratio(self.mixratio)
+                self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, self.temperature, self.pressure).magnitude
+                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24771&new_value="+"{:.1f}".format(self.dewpoint))
+                if r.status_code != requests.codes['ok']:
+                    print("External Dew Point Data could not be written into the Homatic system variables.")
+            except subprocess.TimeoutExpired:
+                print("Waited", self.timeout, "seconds, and did not get any valid data from Homematic")
             if self.stopped.wait(self.read_interval):
                 break
 
@@ -1462,7 +1521,7 @@ parser.add_argument('--jpgquality',
                     help='Image quality (0-100, default 99)')
 # USB speed setting
 parser.add_argument('--usbspeed',
-                    default=90,
+                    default=40,
                     type=check_positive_int,
                     help='USB speed/BandWidthOverload (40-100, default 40)')
 # High speed mode setting
@@ -1951,6 +2010,13 @@ dht22thread = dht22Thread(dht22stopFlag, camera, 300, 10)
 dht22thread.start()
 threads.append(dht22thread)
 
+#Start Temperature and Humidity-Monitoring with Homematic sensor data from Roof sensor. Read out every 5min (300sec) and timeout after 10sec
+
+weatherstopFlag = threading.Event()
+weatherthread = WeatherThread(weatherstopFlag, camera, 300, 10)
+weatherthread.start()
+threads.append(weatherthread)
+
 #Start IR Temperature Monitoring with MLX90614 sensor. Read out every 5min (300sec) and timeout after 10sec
 
 IRSensorstopFlag = threading.Event()
@@ -2151,19 +2217,28 @@ while bMain:
                         lasty = _stamptext(img, caption, lasty, dargs)
                         #Output into the bottom left corner of the image
                         caption = str('Dew Point {:.1f}degC'.\
-                                 format(dht22thread.dewpoint))
+                                 format(weatherthread.dewpoint))
                         lasty = _stamptext(img, caption, dargs.height, dargs, top=False)
-                        caption = str('Housing Hum. {:.1f}%'.\
-                                 format(dht22thread.dht22hum))
+                        caption = str('External Hum. {:.1f}%'.\
+                                 format(weatherthread.humidity))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('Housing Temp. {:.1f}degC'.\
-                                 format(dht22thread.dht22temp))
+                        caption = str('External Temp. {:.1f}'.\
+                                 format(weatherthread.temperature))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         caption = str('IR Amb. Temp. {:.1f}degC'.\
                                  format(IRSensorthread.Ta))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         caption = str('Sky Temp. {:.1f}degC'.\
                                  format(IRSensorthread.Tobj))
+                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                        caption = str('Housing Dew Point {:.1f}degC'.\
+                                 format(dht22thread.dewpoint))
+                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                        caption = str('Housing Hum. {:.1f}%'.\
+                                 format(dht22thread.dht22hum))
+                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                        caption = str('Housing Temp. {:.1f}degC'.\
+                                 format(dht22thread.dht22temp))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         #Output into the top right corner of the image
                         caption = str('Bus Power {:.3f}mW'.\
@@ -2247,6 +2322,7 @@ img = None
 imgarray = None
 imgbay = None
 dht22stopFlag.set()
+weatherstopFlag.set()
 IRSensorstopFlag.set()
 CurrentSensorstopFlag.set()
 
