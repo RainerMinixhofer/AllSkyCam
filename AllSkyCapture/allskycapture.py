@@ -100,7 +100,8 @@ def get_image_statistics(img):
     statistics['Mean'] = mmean
     statistics['StdDev'] = mstd
     # blur detection measure using Variance of Laplacian (see https://www.pyimagesearch.com/2015/09/07/blur-detection-with-opencv/#)
-    statistics['Focus'] = cv2.Laplacian(img, cv2.CV_64F).var()
+    # we take log10 of measure since the spread of the variance can be huge
+    statistics['Focus'] = math.log10(cv2.Laplacian(img, cv2.CV_64F).var())
     return statistics
 
 def postprocess(args):
@@ -296,17 +297,16 @@ class dht22Thread(threading.Thread):
                     print("Data could not be written into the Homematic system variables.")
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
-                self.pressure = units.Quantity(float(re.split('\=| ', r.text)[12][1:-1]), 'hPa')
+                self.pressure = float(re.split('\=| ', r.text)[12][1:-1])
+                press = units.Quantity(self.pressure, 'hPa')
                 self.temperature = units.Quantity(self.dht22temp, 'degC')
                 #Calculate dewpoint from relative humidity, pressure and temperature using metpy and write it into Homematic
-                self.mixratio = mcalc.mixing_ratio_from_relative_humidity(float(self.dht22hum)/100, self.temperature, self.pressure)
+                self.mixratio = mcalc.mixing_ratio_from_relative_humidity(float(self.dht22hum)/100, self.temperature, press)
                 self.specific_humidity = mcalc.specific_humidity_from_mixing_ratio(self.mixratio)
-                self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, self.temperature, self.pressure).magnitude
+                self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, self.temperature, press).magnitude
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22278&new_value="+"{:.1f}".format(self.dewpoint))
                 if r.status_code != requests.codes['ok']:
                     print("Data could not be written into the Homematic system variables.")
-                self.pressure = self.pressure.magnitude
-                self.temperature = self.temperature.magnitude
             except subprocess.TimeoutExpired:
                 print("Waited", self.timeout, "seconds, and did not get any valid data from DHT22")
             if self.stopped.wait(self.read_interval):
@@ -343,7 +343,8 @@ class WeatherThread(threading.Thread):
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12378")
                 if r.status_code != requests.codes['ok']:
                     print("Roof Temperature Data could not be read from the Homematic system.")
-                self.temperature = units.Quantity(float(re.split('=|/|\'', r.text)[-4]), 'degC')
+                self.temperature = float(re.split('=|/|\'', r.text)[-4])
+                temp = units.Quantity(self.temperature, 'degC')
                 #Read Humidity at Roof
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12380")
                 if r.status_code != requests.codes['ok']:
@@ -358,16 +359,15 @@ class WeatherThread(threading.Thread):
                 print("Conditions at Roof: Temperature = ", self.temperature, "°C / Humidity = ", self.humidity, "% / Light Intensity = ", self.intensity)
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
-                self.pressure = units.Quantity(float(re.split('\=| ', r.text)[12][1:-1]), 'hPa')
+                self.pressure = float(re.split('\=| ', r.text)[12][1:-1])
+                press = units.Quantity(self.pressure, 'hPa')
                 #Calculate dewpoint from relative humidity, pressure and temperature using metpy and write it into Homematic
-                self.mixratio = mcalc.mixing_ratio_from_relative_humidity(float(self.humidity)/100, self.temperature, self.pressure)
+                self.mixratio = mcalc.mixing_ratio_from_relative_humidity(float(self.humidity)/100, temp, press)
                 self.specific_humidity = mcalc.specific_humidity_from_mixing_ratio(self.mixratio)
-                self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, self.temperature, self.pressure).magnitude
+                self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, temp, press).magnitude
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24771&new_value="+"{:.1f}".format(self.dewpoint))
                 if r.status_code != requests.codes['ok']:
                     print("External Dew Point Data could not be written into the Homatic system variables.")
-                self.pressure = self.pressure.magnitude
-                self.temperature = self.temperature.magnitude
             except subprocess.TimeoutExpired:
                 print("Waited", self.timeout, "seconds, and did not get any valid data from Homematic")
             if self.stopped.wait(self.read_interval):
@@ -577,7 +577,7 @@ def turnonCamera():
     """
     Switches 5V USB Power of Camera on
     """
-    switchpin(35)
+    switchpin(35, state=True)
     time.sleep(2) # Wait for 2 seconds to ensure that camera has fully powered up
 
 def turnoffCamera():
@@ -594,13 +594,13 @@ def cameraon():
 
 def turnonHeater():
     """
-    Switches 1V Power of Dew-Heater on
+    Switches 12V Power of Dew-Heater on
     """
-    switchpin(33)
+    switchpin(33, state=True)
 
 def turnoffHeater():
     """
-    Switches 1V Power of Dew-Heater off
+    Switches 12V Power of Dew-Heater off
     """
     switchpin(33, state=False)
 
@@ -610,7 +610,7 @@ def heateron():
     """
     return not pinisinput(33) and pinstatus(33)
 
-def heaterControl(tambient, tdewpoint, sensitivity=1.0, hysteresis=0.2):
+def heaterControl(tambient, tdewpoint, sensitivity=1.5, hysteresis=1.0):
     """
     Switches Dew Heater on and off depending on difference between the ambient
     temperature <tambient> and the dew point <tdewpoint>. The default difference
@@ -639,13 +639,13 @@ def heaterControl(tambient, tdewpoint, sensitivity=1.0, hysteresis=0.2):
         r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=1")
         if r.status_code != requests.codes['ok']:
             print("Data could not be written into the Homatic system variable.")
-        print("Dew Heater turned on")
+        print("\n\nDew Heater turned on(Ta=%f,Td=%f)\n\n" % (tambient,tdewpoint))
     elif heateron() and tambient - tdewpoint > sensitivity + hysteresis:
         turnoffHeater()
         r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=0")
         if r.status_code != requests.codes['ok']:
             print("Data could not be written into the Homatic system variable.")
-        print("Dew Heater turned off")
+        print("\n\nDew Heater turned off(Ta=%f,Td=%f)\n\n" % (tambient,tdewpoint))
 
 class INA219:
     """Class containing the INA219 functionality."""
@@ -2217,7 +2217,7 @@ while bMain:
                 # to be switched on or off depending on the ambient temperature
                 # and the calculated dew-point
                 if not isday(False):
-                    heaterControl(weatherthread.temperature, weatherthread.dewpoint, sensitivity=1.0, hysteresis=0.2)
+                    heaterControl(weatherthread.temperature, weatherthread.dewpoint, sensitivity=1.5, hysteresis=1.0)
                 # read image as bytearray from camera
                 print("Starting Exposure")
 
@@ -2339,6 +2339,11 @@ while bMain:
                         caption = str('Bus Power {:.3f}mW'.\
                                  format(CurrentSensorthread.power))
                         lasty = _stamptext(img, caption, 0, dargs, left=False, top=True)
+                        if heateron():
+                            caption = 'Heater is ON'
+                        else:
+                            caption = 'Heater is OFF'
+                        lasty = _stamptext(img, caption, lasty, dargs, left=False, top=True)
                 # save control values of camera and
                 # do some simple statistics on image and save to associated text file with the camera settings
                 if args.metadata is not None:
@@ -2405,6 +2410,8 @@ while bMain:
                     time.sleep(args.delayDaytime/1000.0 if lastisday else args.delay/1000.0)
 
                 if not(lastisday) and isday(False):
+                    # Switch off heater
+                    turnoffHeater()
                     # Do postprocessing (write video, do startrails and keogram images)
                     postprocess(args)
 
