@@ -167,6 +167,8 @@ def writeImage(filename, img, camera, args, timestring):
         exiftags['GPSLongitude'] = math.fabs(args.lon)
         exiftags['GPSLatitudeRef'] = 'S' if args.lat < 0 else 'N'
         exiftags['GPSLatitude'] = math.fabs(args.lat)
+        exiftags['GPSAltitudeRef'] = 1 if args.elevation < 0 else 0
+        exiftags['GPSAltitude'] = math.fabs(args.elevation)
         # Change/update EXIF tags in file
         exifpars = ['/usr/bin/exiftool', '-config', '/home/rainer/.ExifTool_config', '-overwrite_original']
         for tag, value in exiftags.items():
@@ -345,6 +347,7 @@ class dht22Thread(threading.Thread):
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
                 self.pressure = float(re.split('\=| ', r.text)[12][1:-1])
+                position.pressure = self.pressure
                 press = units.Quantity(self.pressure, 'hPa')
                 self.temperature = units.Quantity(self.dht22temp, 'degC')
                 #Calculate dewpoint from relative humidity, pressure and temperature using metpy and write it into Homematic
@@ -391,6 +394,7 @@ class WeatherThread(threading.Thread):
                 if r.status_code != requests.codes['ok']:
                     print("Roof Temperature Data could not be read from the Homematic system.")
                 self.temperature = float(re.split('=|/|\'', r.text)[-4])
+                position.temp = self.temperature
                 temp = units.Quantity(self.temperature, 'degC')
                 #Read Humidity at Roof
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12380")
@@ -407,6 +411,7 @@ class WeatherThread(threading.Thread):
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
                 r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
                 self.pressure = float(re.split('\=| ', r.text)[12][1:-1])
+                position.pressure = self.pressure
                 press = units.Quantity(self.pressure, 'hPa')
                 #Calculate dewpoint from relative humidity, pressure and temperature using metpy and write it into Homematic
                 self.mixratio = mcalc.mixing_ratio_from_relative_humidity(float(self.humidity)/100, temp, press)
@@ -1695,6 +1700,11 @@ parser.add_argument('--lat',
 parser.add_argument('--lon',
                     default='15.398836E',
                     help='Position longitude (180W-180E, default 15.399E, Premstaetten)')
+# Position elevation setting
+parser.add_argument('--elevation',
+                    default=350,
+                    type=float,
+                    help='Position elevation in Meters (default 350.0, Premstaetten)')
 # Altitude of sun for twilight setting
 parser.add_argument('--twilight',
                     default='Civil',
@@ -1933,6 +1943,7 @@ position = ephem.Observer()
 position.pressure = 0
 position.lon = args.lon * math.pi / 180
 position.lat = args.lat * math.pi / 180
+position.elevation = args.elevation
 isday = IsDay(position)
 
 print("Position: Lat: %s / Lon: %s" % (position.lat, position.lon))
