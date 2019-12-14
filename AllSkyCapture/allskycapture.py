@@ -80,7 +80,7 @@ def save_control_values(filename, settings, params):
             f.write('%s: %s\n' % (k, str(params[k])))
     print('Camera settings saved to %s' % filename)
     #Write Camera Focus measure into Homematic
-    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22416&new_value="+"{:.1f}".format(params["Focus"]))
+    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22416&new_value="+"{:.4f}".format(params["Focus"]))
     if r.status_code != requests.codes['ok']:
         print("Data could not be written into the Homatic system variables.")
 
@@ -103,6 +103,81 @@ def get_image_statistics(img):
     # we take log10 of measure since the spread of the variance can be huge
     statistics['Focus'] = math.log10(cv2.Laplacian(img, cv2.CV_64F).var())
     return statistics
+
+def writeImage(filename, img, camera, args, timestring):
+    """
+    Saves img data structure as image into filename filename. Camera
+    parameters and the image statistics are saved into the EXIF tags in
+    the image file. Timestring gives the timestamp of the image to be saved into
+    the EXIF tags as well.
+    """
+    extension = filename.lower().split('.')[-1]
+    # save control values of camera and
+    # do some simple statistics on image and save to associated text file with the camera settings
+    if args.metadata is not None:
+        camctrls = camera.get_control_values()
+        imgstats = get_image_statistics(img)
+        if 'txt' in args.metadata:
+            save_control_values(filebase, camctrls, imgstats)
+    # write image based on extension specification and data compression parameters
+    if extension == 'jpg':
+        filename = filebase+'.jpg'
+        params = [int(cv2.IMWRITE_JPEG_QUALITY), args.jpgquality]
+    elif extension == 'png':
+        filename = filebase+'.png'
+        params = [int(cv2.IMWRITE_PNG_COMPRESSION), args.pngcompression]
+    elif extension == 'tif':
+        filename = filebase+'.png'
+        # Use TIFFTAG_COMPRESSION=259 to specify COMPRESSION_LZW=5
+#        params = [259, 5]
+        params = [int(cv2.IMWRITE_TIFF_COMPRESSION), 5]
+    elif extension == 'fits':
+        # use astropy to write FITS image
+        if (args.channels == 1) and not args.dodebayer:
+            hdu = fits.PrimaryHDU(data=img[:, :, 0])
+        else:
+            hdu = fits.PrimaryHDU(data=[img[:, :, 0], img[:, :, 1], img[:, :, 2]])
+        hdu.writeto(filebase + '.fits')
+    elif extension == 'hdr':
+        params = None
+
+    print("Saving image " + filename)
+    status = cv2.imwrite(filename, img, params=params)
+    if (args.metadata is not None) and ('exif' in args.metadata):
+        print("Writing EXIF tags")
+        exiftags = {**camctrls, **imgstats}
+        # Generate dictionary of EXIF tags from camera control values and image statistics
+        exiftags['ExposureTime'] = exiftags.pop('Exposure')
+        exiftags['FNumber'] = 2.0
+        exiftags['ISO'] = 100
+        exiftags['FocalLength'] = 1.55
+        exiftags['LensModel'] = 'Arecont Vision Fisheye'
+        exiftags['ChipTemperature'] = exiftags.pop('Temperature')
+        exiftags['ChipTemperature'] /= 10
+        exiftags['ImageMean'] = exiftags.pop('Mean')
+        exiftags['ImageStdDev'] = exiftags.pop('StdDev')
+        exiftags['Make'], exiftags['Model'] = cameras_found[camera_id].split(' ')
+        exiftags['AllDates'] = timestring.strftime("%Y.%m.%d %H:%M:%S")
+        exiftags['Artist'] = 'Rainer Minixhofer'
+        exiftags['Country'] = 'Austria'
+        exiftags['Province'] = 'Styria'
+        exiftags['City'] = 'Premstaetten'
+        exiftags['Location'] = 'Premstaetten'
+        exiftags['GPSLongitudeRef'] = 'W' if args.lon < 0 else 'E'
+        exiftags['GPSLongitude'] = math.fabs(args.lon)
+        exiftags['GPSLatitudeRef'] = 'S' if args.lat < 0 else 'N'
+        exiftags['GPSLatitude'] = math.fabs(args.lat)
+        # Change/update EXIF tags in file
+        exifpars = ['/usr/bin/exiftool', '-config', '/home/rainer/.ExifTool_config', '-overwrite_original']
+        for tag, value in exiftags.items():
+            exifpars.append("-{}={}".format(tag, value))
+        exifpars.append(filename)
+        process = subprocess.run(exifpars, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if args.debug:
+            print('EXIFtool stdout: %s' % process.stdout)
+        if args.debug:
+            print('EXIFtool stderr: %s' % process.stderr)
+    return status
 
 def postprocess(args):
     """
@@ -180,14 +255,9 @@ def postprocess(args):
             if startrails is None:
                 print('No images below threshold, writing the minimum image only')
                 startrails = cv2.imread(imgfiles[min_loc[1]], cv2.IMREAD_UNCHANGED)
-            if args.extension == "png":
-                args.fileoptions = [int(cv2.IMWRITE_PNG_COMPRESSION), 9]
-            elif args.extension == "jpg":
-                args.fileoptions = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
-            else: args.fileoptions = []
-
             startfile = args.dirtime_12h_ago_path+'/'+args.startrailsoutput[:-4]+args.dirtime_12h_ago+args.startrailsoutput[-4:]
-            status = cv2.imwrite(startfile, startrails, args.fileoptions)
+            status = writeImage(startfile, startrails, camera, args, datetime.datetime.now())
+#            status = cv2.imwrite(startfile, startrails, args.fileoptions)
             if args.serverrepo != 'none':
                 if '@' in args.serverrepo:
                     os.system("scp "+startfile+" "+args.serverrepo+"/")
@@ -196,7 +266,8 @@ def postprocess(args):
             print("Startrail Image", startfile, " written to file-system : ", status)
         if dokeogr:
             geogrfile = args.dirtime_12h_ago_path+'/'+args.keogramoutput[:-4]+args.dirtime_12h_ago+args.keogramoutput[-4:]
-            status = cv2.imwrite(geogrfile, keogram, args.fileoptions)
+            status = writeImage(geogrfile, keogram, camera, args, datetime.datetime.now())
+#            status = cv2.imwrite(geogrfile, keogram, args.fileoptions)
             if args.serverrepo != 'none':
                 if '@' in args.serverrepo:
                     os.system("scp "+geogrfile+" "+args.serverrepo+"/")
@@ -218,41 +289,17 @@ class saveThread(threading.Thread):
     """
     thread for saving image
     """
-    def __init__(self, filename, img, params, camctrls, imgstats, timestring):
+    def __init__(self, filename, img, camera, args, timestring):
         threading.Thread.__init__(self)
         self.filename = filename
         self.img = img
-        self.params = params
-        self.camctrls = camctrls
-        self.imgstats = imgstats
+        self.camera = camera
+        self.args = args
         self.timestring = timestring
     def run(self):
-        print("Saving image " + self.filename)
         # Get lock to synchronize threads
         threadLock.acquire()
-        cv2.imwrite(self.filename, self.img, self.params)
-        if (args.metadata is not None) and ('exif' in args.metadata):
-            print("Writing EXIF tags")
-            exiftags = {**camctrls, **imgstats}
-            # Generate dictionary of EXIF tags from camera control values and image statistics
-            exiftags['ExposureTime'] = exiftags.pop('Exposure')
-            exiftags['ChipTemperature'] = exiftags.pop('Temperature')
-            exiftags['ChipTemperature'] /= 10
-            exiftags['ImageMean'] = exiftags.pop('Mean')
-            exiftags['ImageStdDev'] = exiftags.pop('StdDev')
-            exiftags['Make'], exiftags['Model'] = cameras_found[camera_id].split(' ')
-            exiftags['AllDates'] = timestring.strftime("%Y.%m.%d %H:%M:%S")
-            exiftags['Artist'] = 'Rainer Minixhofer'
-            # Change/update EXIF tags in file
-            exifpars = ['/usr/bin/exiftool', '-config', '/home/rainer/.ExifTool_config', '-overwrite_original']
-            for tag, value in exiftags.items():
-                exifpars.append("-{}={}".format(tag, value))
-            exifpars.append(self.filename)
-            process = subprocess.run(exifpars, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-            if args.debug:
-                print('EXIFtool stdout: %s' % process.stdout)
-            if args.debug:
-                print('EXIFtool stderr: %s' % process.stderr)
+        writeImage(self.filename, self.img, self.camera, self.args, self.timestring)
         # Free lock to release next thread
         threadLock.release()
 
@@ -639,13 +686,13 @@ def heaterControl(tambient, tdewpoint, sensitivity=1.5, hysteresis=1.0):
         r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=1")
         if r.status_code != requests.codes['ok']:
             print("Data could not be written into the Homatic system variable.")
-        print("\n\nDew Heater turned on(Ta=%f,Td=%f)\n\n" % (tambient,tdewpoint))
+        print("\n\nDew Heater turned on(Ta=%f,Td=%f)\n\n" % (tambient, tdewpoint))
     elif heateron() and tambient - tdewpoint > sensitivity + hysteresis:
         turnoffHeater()
         r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=0")
         if r.status_code != requests.codes['ok']:
             print("Data could not be written into the Homatic system variable.")
-        print("\n\nDew Heater turned off(Ta=%f,Td=%f)\n\n" % (tambient,tdewpoint))
+        print("\n\nDew Heater turned off(Ta=%f,Td=%f)\n\n" % (tambient, tdewpoint))
 
 class INA219:
     """Class containing the INA219 functionality."""
@@ -1304,7 +1351,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
         imgbay = nparray.reshape((args.height, args.width, args.channels))
 
         # Debayer image in the case of RAW8 or RAW16 images
-        if dodebayer:
+        if args.dodebayer:
             # Define image array here, to ensure that an image array is generated with imgs.append below
             img = np.zeros((args.height, args.width, 3), nparraytype)
             # take care that opencv channel order is B,G,R instead of R,G,B
@@ -1331,23 +1378,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
     for i, img in enumerate(imgs):
         print('Save %d frame of %d' % (i + 1, len(imgs)))
         filebase = analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i])
-        if args.extension == 'jpg':
-            cv2.imwrite(filebase+'.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY),
-                                               args.jpgquality])
-        elif args.extension == 'png':
-            cv2.imwrite(filebase+'.png', img, [int(cv2.IMWRITE_PNG_COMPRESSION),
-                                               args.pngcompression])
-        elif args.extension == 'tif':
-            # Use TIFFTAG_COMPRESSION=259 to specify COMPRESSION_LZW=5
-            cv2.imwrite(filebase+'.tif', img, [259, 5])
-        elif args.extension == 'fits':
-            # use astropy to write FITS image
-            if (args.channels == 1) and not dodebayer:
-                hdu = fits.PrimaryHDU(data=img[:, :, 0])
-            else:
-                hdu = fits.PrimaryHDU(data=[img[:, :, 0], img[:, :, 1], img[:, :, 2]])
-            hdu.writeto(filebase + '.fits')
-
+        writeImage(filebase+'.'+args.extension, img, camera, args, datetime.datetime.now())
 
     print("Restoring camera settings to original values.")
 
@@ -1371,25 +1402,27 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
     calibrate = cv2.createCalibrateDebevec()
     # convert images from 16bit to 8bit since algorithms does not support 16bit images
     for i, img in enumerate(imgs):
-        img = np.uint8(img)
-#    response = calibrate.process(imgs, times)
+#        img = np.uint8(img)
+        img = (img/256).astype('uint8')
+    response = calibrate.process(imgs, times)
 
     # Make HDR Image
-#    merge_debevec = cv2.createMergeDebevec()
-#    hdr = merge_debevec.process(imgs, times, response)
+    merge_debevec = cv2.createMergeDebevec()
+    hdr = merge_debevec.process(imgs, times, response)
 
     # Tonemap HDR image
-#    tonemap = cv2.createTonemap(2.2)
-#    ldr = tonemap.process(hdr)
+    tonemap = cv2.createTonemap(2.2)
+    ldr = tonemap.process(hdr)
 
     # Perform exposure fusion
-#    merge_mertens = cv2.createMergeMertens()
-#    fusion = merge_mertens.process(imgs)
+    merge_mertens = cv2.createMergeMertens()
+    fusion = merge_mertens.process(imgs)
 
     # Write results
-#    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'fusion.png', fusion * 255)
-#    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'ldr.png', ldr * 255)
-#    cv2.imwrite(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'hdr.hdr', hdr)
+    writeImage(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'fusion.'+args.extension, fusion * 255, camera, args, datetime.datetime.now())
+    writeImage(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'ldr.'+args.extension, ldr * 255, camera, args, datetime.datetime.now())
+    writeImage(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'hdr.hdr', hdr, camera, args, datetime.datetime.now())
+
     print("Analemma HDR image processing finished")
 
 
@@ -1787,9 +1820,9 @@ parser.add_argument('--serverrepo',
                     (Default /mnt/MultimediaAllSkyCam)''')
 # Autodelete when more than specified nights
 parser.add_argument('--nightstokeep',
-                    default=11,
+                    default=9,
                     type=int,
-                    help='Number of nights to keep before start deleting. Set to negative to disable. (Default 11)')
+                    help='Number of nights to keep before start deleting. Set to negative to disable. (Default 10)')
 # Run focus scale exposure
 parser.add_argument('--focusscale',
                     default='',
@@ -2062,13 +2095,13 @@ autoExp = 0
 # get bytearray for buffer to store image
 imgarray = bytearray(args.width*args.height*pixelstorage)
 img = np.zeros((args.height, args.width, 3), nparraytype)
-dodebayer = (args.type == asi.ASI_IMG_RAW8 or args.type == asi.ASI_IMG_RAW16) and args.debayeralg != 'none'
+args.dodebayer = (args.type == asi.ASI_IMG_RAW8 or args.type == asi.ASI_IMG_RAW16) and args.debayeralg != 'none'
 
 # If aperture should be masked, apply circular masking
 if args.maskaperture:
     print("Masking aperture")
     #Define mask image of same size as image
-    mask = np.zeros((args.height, args.width, 3 if dodebayer else args.channels), dtype=nparraytype)
+    mask = np.zeros((args.height, args.width, 3 if args.dodebayer else args.channels), dtype=nparraytype)
     #Define circle with origin in center of image and radius given by the smaller side of the image
 #    cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (255, 255, 255), -1)
     cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (1, 1, 1), -1)
@@ -2217,7 +2250,7 @@ while bMain:
                 # to be switched on or off depending on the ambient temperature
                 # and the calculated dew-point
                 if not isday(False):
-                    heaterControl(weatherthread.temperature, weatherthread.dewpoint, sensitivity=1.5, hysteresis=1.0)
+                    heaterControl(IRSensorthread.Tobj, weatherthread.dewpoint, sensitivity=1.5, hysteresis=5.0)
                 # read image as bytearray from camera
                 print("Starting Exposure")
 
@@ -2254,7 +2287,7 @@ while bMain:
                     print("==>Memory after nparray assignment: %s percent. " % psutil.virtual_memory()[2])
 
                 # Debayer image in the case of RAW8 or RAW16 images
-                if dodebayer:
+                if args.dodebayer:
                     # reshape numpy array back to image matrix depending on image type.
                     # take care that opencv channel order is B,G,R instead of R,G,B
                     imgbay = nparray.reshape((args.height, args.width, args.channels))
@@ -2344,28 +2377,9 @@ while bMain:
                         else:
                             caption = 'Heater is OFF'
                         lasty = _stamptext(img, caption, lasty, dargs, left=False, top=True)
-                # save control values of camera and
-                # do some simple statistics on image and save to associated text file with the camera settings
-                if args.metadata is not None:
-                    camctrls = camera.get_control_values()
-                    imgstats = get_image_statistics(img)
-                    if 'txt' in args.metadata:
-                        save_control_values(filebase, camctrls, imgstats)
-                # write image based on extension specification and data compression parameters
-                if args.extension == 'jpg':
-                    thread = saveThread(filebase+'.jpg', img, \
-                                        [int(cv2.IMWRITE_JPEG_QUALITY), args.jpgquality], camctrls, imgstats, timestring)
-                    thread.start()
-                #    print('Saved to %s' % filename)
-                elif args.extension == 'png':
-                    thread = saveThread(filebase+'.png', img, \
-                                        [int(cv2.IMWRITE_PNG_COMPRESSION), args.pngcompression], camctrls, imgstats, timestring)
-                    thread.start()
-                elif args.extension == 'tif':
-                    # Use TIFFTAG_COMPRESSION=259 to specify COMPRESSION_LZW=5
-                    thread = saveThread(filebase+'.tif', img, [259, 5], camctrls, imgstats, timestring)
-                    thread.start()
-                #    print('Saved to %s' % filename)
+                # write image
+                thread = saveThread(filebase+'.'+args.extension, img, camera, args, timestring)
+                thread.start()
                 threads.append(thread)
 
                 # Reduce focusscale counter if specified and move stepper motor by focusstep
