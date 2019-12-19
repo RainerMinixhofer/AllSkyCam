@@ -82,7 +82,7 @@ def save_control_values(filename, settings, params):
     #Write Camera Focus measure into Homematic
     r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22416&new_value="+"{:.4f}".format(params["Focus"]))
     if r.status_code != requests.codes['ok']:
-        print("Data could not be written into the Homatic system variables.")
+        print("Data could not be written into the Homematic system variables.")
 
 
 def get_image_statistics(img):
@@ -97,11 +97,13 @@ def get_image_statistics(img):
         mmean /= 255.0
     elif img.dtype.name == 'uint16':
         mmean /= 65535.0
+    print("Image Type: %s" % img.dtype.name)
     statistics['Mean'] = mmean
     statistics['StdDev'] = mstd
     # blur detection measure using Variance of Laplacian (see https://www.pyimagesearch.com/2015/09/07/blur-detection-with-opencv/#)
     # we take log10 of measure since the spread of the variance can be huge
-    statistics['Focus'] = math.log10(cv2.Laplacian(img, cv2.CV_64F).var())
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    statistics['Focus'] = math.log10(cv2.Laplacian(gray, cv2.CV_64F).var())
     return statistics
 
 def writeImage(filename, img, camera, args, timestring):
@@ -111,7 +113,8 @@ def writeImage(filename, img, camera, args, timestring):
     the image file. Timestring gives the timestamp of the image to be saved into
     the EXIF tags as well.
     """
-    extension = filename.lower().split('.')[-1]
+    filebase, extension = filename.split('.')
+    extension = extension.lower()
     # save control values of camera and
     # do some simple statistics on image and save to associated text file with the camera settings
     if args.metadata is not None:
@@ -121,13 +124,10 @@ def writeImage(filename, img, camera, args, timestring):
             save_control_values(filebase, camctrls, imgstats)
     # write image based on extension specification and data compression parameters
     if extension == 'jpg':
-        filename = filebase+'.jpg'
         params = [int(cv2.IMWRITE_JPEG_QUALITY), args.jpgquality]
     elif extension == 'png':
-        filename = filebase+'.png'
         params = [int(cv2.IMWRITE_PNG_COMPRESSION), args.pngcompression]
     elif extension == 'tif':
-        filename = filebase+'.png'
         # Use TIFFTAG_COMPRESSION=259 to specify COMPRESSION_LZW=5
 #        params = [259, 5]
         params = [int(cv2.IMWRITE_TIFF_COMPRESSION), 5]
@@ -181,7 +181,7 @@ def writeImage(filename, img, camera, args, timestring):
             print('EXIFtool stderr: %s' % process.stderr)
     return status
 
-def postprocess(args):
+def postprocess(args, camera):
     """
     does postprocessing of saved images and generates video, startrails and keogram
     """
@@ -1221,11 +1221,23 @@ def lmt2utc(lmt, longitude):
     utcdt = utcdt.replace(tzinfo=utc)
     return utcdt
 
-def getanalemma(args, camera, pixelstorage, nparraytype):
+blockimaging = False
+
+def switchblock(blockstate):
+    """
+    Switches global variable blockimaging to blockstate. If blockstate is
+    true, the main loop is blocked to take images. After getanalemma execution
+    is finished blockimaging is set back to False to enable imaging in main
+    loop again
+    """
+    global blockimaging # pylint: disable=W0603
+    blockimaging = blockstate
+
+def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     """
     Captures one image of the current sun position to be assembled into one analemma
     """
-    print("Analemma Capture Time triggered")
+    print(prefix+"Analemma Capture Time triggered")
     # Generate analemma subdirectory if this directory is not present and if the analemma parameter is specified
     analemmabase = args.dirname + "/analemma"
     if not os.path.isdir(analemmabase):
@@ -1307,7 +1319,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
     print("Final autoexposure: %d \u03BCs" % autoex)
 
     # read image as bytearray from camera
-    print("Starting Analemma HDR capture\n")
+    print("Starting "+prefix+"Analemma HDR capture\n")
 
     camera.stop_video_capture()
     camera.stop_exposure()
@@ -1348,8 +1360,6 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
 
         print("Exposure: %d us" % exposure)
 
-        # Define file base string (for image and image info file)
-        filebase = analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(exposure)
         # convert bytearray to numpy array
         nparray = np.frombuffer(imgarray, nparraytype)
         # reshape numpy array back to image matrix depending on image type.
@@ -1375,14 +1385,15 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
         # save image and exposure time into array for postprocessing
         imgs.append(img)
 
-    print("Analemma HDR frame capture finished.")
+    print(prefix+"Analemma HDR frame capture finished.")
 
     print('File Extension is %s' % args.extension.upper())
 
     # write image based on extension specification and data compression parameters
     for i, img in enumerate(imgs):
         print('Save %d frame of %d' % (i + 1, len(imgs)))
-        filebase = analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i])
+        # Define file base string (for image and image info file)
+        filebase = analemmabase+'/'+prefix.tolower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i])
         writeImage(filebase+'.'+args.extension, img, camera, args, datetime.datetime.now())
 
     print("Restoring camera settings to original values.")
@@ -1405,10 +1416,11 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
 
     # Estimate camera response
     calibrate = cv2.createCalibrateDebevec()
-    # convert images from 16bit to 8bit since algorithms does not support 16bit images
-    for i, img in enumerate(imgs):
-#        img = np.uint8(img)
-        img = (img/256).astype('uint8')
+    # convert images from 16bit to 8bit since HDRI algorithm does not support 16bit images
+    for i in range(len(imgs)):
+        if imgs[i].dtype == np.uint16:
+            imgs[i] = (imgs[i]/256).astype(np.uint8)
+
     response = calibrate.process(imgs, times)
 
     # Make HDR Image
@@ -1424,11 +1436,19 @@ def getanalemma(args, camera, pixelstorage, nparraytype):
     fusion = merge_mertens.process(imgs)
 
     # Write results
-    writeImage(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'fusion.'+args.extension, fusion * 255, camera, args, datetime.datetime.now())
-    writeImage(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'ldr.'+args.extension, ldr * 255, camera, args, datetime.datetime.now())
-    writeImage(analemmabase+'/analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'hdr.hdr', hdr, camera, args, datetime.datetime.now())
+    orgmeta = args.metadata
+    args.metadata = None
+    fusion *= 255
+    img = fusion.astype(np.uint8)
+    writeImage(analemmabase+'/'+prefix.tolower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'fusion.'+args.extension, img, camera, args, datetime.datetime.now())
+    ldr *= 255
+    img = ldr.astype(np.uint8)
+    writeImage(analemmabase+'/'+prefix.tolower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'ldr.'+args.extension, img, camera, args, datetime.datetime.now())
+    writeImage(analemmabase+'/'+prefix.tolower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'hdr.hdr', hdr, camera, args, datetime.datetime.now())
+    args.metadata = orgmeta
 
-    print("Analemma HDR image processing finished")
+    print(prefix+"Analemma HDR image processing finished")
+    switchblock(False)
 
 
 def turnOffMotors():
@@ -1844,7 +1864,7 @@ parser.add_argument('--focusscale',
                     second number of argument. The arguments need to be separated by comma. \
                     (If specified without parameter 11,10 is taken)')
 
-# Do analemma exposures
+# Do sun analemma exposures
 parser.add_argument('--analemma',
                     default='',
                     const='meanmidday',
@@ -1857,6 +1877,24 @@ parser.add_argument('--analemma',
                     The exposure parameters for this setting are taken from the file analemma.cfg in \
                     the same directory as this script, if this file is present. \
                     (if specified without parameter "meanmidday" is taken)')
+
+# Do moon analemma exposures
+parser.add_argument('--moonanalemma',
+                    default='',
+                    const='meanmeridian',
+                    nargs='?',
+                    type=str,
+                    help='If specified, an exposure is taken at the specified time difference to the mean moon transit each day and saved. \
+                    into the subfolder "analemma". The time has to be specified as \
+                    float number in hours and is taken positive after the meridian transit \
+                    and negative before meridian transit.\
+                    The predefined keyword "meanmeridian", selects the time for the meridian transit. \
+                    The transit time specified is just for the first days exposure, for the subsequent exposures \
+                    the mean delay of the moon rise of about 51mins is taken into account to set the next \
+                    exposure time.\
+                    The exposure parameters for this setting are taken from the file moonanalemma.cfg in \
+                    the same directory as this script, if this file is present. \
+                    (if specified without parameter "meanmeridian" is taken)')
 
 # Define output types for image metadata
 parser.add_argument('--metadata',
@@ -1876,12 +1914,6 @@ args = parser.parse_args()
 args.dirname = os.getcwd()
 args.extension = args.filename.lower().split('.')[-1]
 
-# Do postprocessing if postprocessonly is set and exit
-if args.postprocessonly:
-    args.dirtime_12h_ago_path = os.getcwd()
-    args.dirtime_12h_ago = os.path.basename(os.path.normpath(args.dirtime_12h_ago_path))
-    postprocess(args)
-    exit()
 # Check validity of parameters
 if args.lat[-1] not in ['N', 'S']:
     print('Latitude specification must be a degree float ending with "N" or "S"')
@@ -1976,6 +2008,15 @@ else:
     print('Using #%d: %s' % (camera_id, cameras_found[camera_id]))
 
 camera = asi.Camera(camera_id)
+
+# Do postprocessing if postprocessonly is set and exit
+if args.postprocessonly:
+    args.dirtime_12h_ago_path = os.getcwd()
+    args.dirtime_12h_ago = os.path.basename(os.path.normpath(args.dirtime_12h_ago_path))
+    postprocess(args, camera)
+    camera.close()
+    exit()
+
 camera_info = camera.get_camera_property()
 print('Camera Properties:')
 for k, v in camera_info.items():
@@ -2163,22 +2204,37 @@ CurrentSensorthread = CurrentSensorThread(CurrentSensorstopFlag, camera, 300, 10
 CurrentSensorthread.start()
 threads.append(CurrentSensorthread)
 
-if args.analemma != '':
+if args.analemma != '' or args.moonanalemma != '':
     # initialize scheduler with UTC time
     scheduler = BackgroundScheduler(timezone=utc.zone)
-    # Calculate trigger UTC time from mean local time
-    if args.analemma.lower() == 'meanmidday':
-        args.analemma = '12:00:00'
-    if args.analemma.lower() != 'now':
-        analemmatrigger = lmt2utc(datetime.datetime.strptime(args.analemma, '%H:%M:%S'), position.lon)
-    else:
-        analemmatrigger = datetime.datetime.utcnow() + datetime.timedelta(seconds=10) # ensure that the event happens after starting the script
-    print('Analemma Trigger Time in UTC: %s' % analemmatrigger.strftime("%H:%M:%S"))
-    print('                      local : %s' % analemmatrigger.replace(tzinfo=datetime.timezone.utc).astimezone(tz=datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo).strftime("%H:%M:%S"))
     scheduler.start()
-    scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, pixelstorage, nparraytype], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second)
-
-#bMain = False
+    if args.analemma != '':
+        # Calculate trigger UTC time from mean local time
+        if args.analemma.lower() == 'meanmidday':
+            args.analemma = '12:00:00'
+        if args.analemma.lower() != 'now':
+            analemmatrigger = lmt2utc(datetime.datetime.strptime(args.analemma, '%H:%M:%S'), position.lon)
+        else:
+            analemmatrigger = datetime.datetime.utcnow() + datetime.timedelta(seconds=10+args.delayDaytime) # ensure that the event happens after starting the script
+        analemmablock = analemmatrigger - datetime.timedelta(seconds=args.delayDaytime)
+        print('Analemma Trigger Time in UTC: %s' % analemmatrigger.strftime("%H:%M:%S"))
+        print('                      local : %s' % analemmatrigger.replace(tzinfo=datetime.timezone.utc).astimezone(tz=datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo).strftime("%H:%M:%S"))
+        scheduler.add_job(switchblock, trigger='cron', args=[True], hour=analemmablock.time().hour, minute=analemmablock.time().minute, second=analemmablock.time().second)
+        scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, pixelstorage, nparraytype, ''], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second)
+    if args.moonanalemma != '':
+        # Calculate trigger UTC time from specified time difference to transit time
+        if args.moonanalemma.lower() == 'meridian':
+            args.moonanalemma = 0.0
+        else:
+            args.moonanalemma = float(args.moonanalemma)
+        moon = ephem.Moon()
+        position.date = datetime.datetime.utcnow()
+        moonanalemmatrigger = position.next_transit(moon) + datetime.timedelta(hours=args.moonanalemma)
+        moonanalemmablock = moonanalemmatrigger - datetime.timedelta(seconds=args.delay)
+        print('Moon Analemma Trigger Time in UTC: %s' % moonanalemmatrigger.strftime("%H:%M:%S"))
+        print('                           local : %s' % moonanalemmatrigger.replace(tzinfo=datetime.timezone.utc).astimezone(tz=datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo).strftime("%H:%M:%S"))
+        scheduler.add_job(switchblock, trigger='cron', args=[True], hour=moonanalemmablock.time().hour, minute=moonanalemmablock.time().minute, second=moonanalemmablock.time().second)
+        scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, pixelstorage, nparraytype, 'Moon'], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second)
 
 while bMain:
 
@@ -2189,6 +2245,16 @@ while bMain:
             if args.debug:
                 print("It's daytime... we're not saving images")
             time.sleep(args.delayDaytime/1000)
+        elif blockimaging:
+            # Switched on during taking of analemmas (sun and moon)
+            # Then the routine just waits for the time delayDaytime in ms at day
+            # and for delay in ms at night
+            if args.debug:
+                print("Taking analemma... timelapse image capture interrupted")
+            if lastisday:
+                time.sleep(args.delayDaytime/1000)
+            else:
+                time.sleep(args.delay/1000)
         else:
             # We use the date 12hrs ago to ensure that we do not have a date
             # jump during night capture, especially for high latitudes
@@ -2358,17 +2424,17 @@ while bMain:
                         caption = str('Dew Point {:.1f}degC'.\
                                  format(weatherthread.dewpoint))
                         lasty = _stamptext(img, caption, dargs.height, dargs, top=False)
-                        caption = str('External Hum. {:.1f}%'.\
-                                 format(weatherthread.humidity))
-                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         caption = str('External Temp. {:.1f}degC'.\
                                  format(weatherthread.temperature))
+                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                        caption = str('Dome Temp. {:.1f}degC'.\
+                                 format(IRSensorthread.Tobj))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         caption = str('IR Amb. Temp. {:.1f}degC'.\
                                  format(IRSensorthread.Ta))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('Sky Temp. {:.1f}degC'.\
-                                 format(IRSensorthread.Tobj))
+                        caption = str('Housing Temp. {:.1f}degC'.\
+                                 format(dht22thread.dht22temp))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         caption = str('Housing Dew Point {:.1f}degC'.\
                                  format(dht22thread.dewpoint))
@@ -2376,8 +2442,8 @@ while bMain:
                         caption = str('Housing Hum. {:.1f}%'.\
                                  format(dht22thread.dht22hum))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('Housing Temp. {:.1f}degC'.\
-                                 format(dht22thread.dht22temp))
+                        caption = str('External Hum. {:.1f}%'.\
+                                 format(weatherthread.humidity))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         #Output into the top right corner of the image
                         caption = str('Bus Power {:.3f}mW'.\
@@ -2438,7 +2504,7 @@ while bMain:
                     # Switch off heater
                     turnoffHeater()
                     # Do postprocessing (write video, do startrails and keogram images)
-                    postprocess(args)
+                    postprocess(args, camera)
 
             camera.stop_video_capture()
             camera.stop_exposure()
