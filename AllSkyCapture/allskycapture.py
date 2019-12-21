@@ -45,6 +45,8 @@ imgformat = ['RAW8', 'RGB24', 'RAW16', 'Y8'] # Supported image formats
 threadLock = threading.Lock()
 threads = []
 
+meantranstimemoon = datetime.timedelta(hours=1/(1/(24/1.00273781191135448)-1/(360*24/(1732564372.58130/3600/36525)))) # mean time between two moon transits in hours
+
 asi_filename = '/usr/lib/libASICamera2.so'
 
 class IsDay():
@@ -97,7 +99,8 @@ def get_image_statistics(img):
         mmean /= 255.0
     elif img.dtype.name == 'uint16':
         mmean /= 65535.0
-    print("Image Type: %s" % img.dtype.name)
+    if args.debug:
+        print("Image Type: %s" % img.dtype.name)
     statistics['Mean'] = mmean
     statistics['StdDev'] = mstd
     # blur detection measure using Variance of Laplacian (see https://www.pyimagesearch.com/2015/09/07/blur-detection-with-opencv/#)
@@ -1237,6 +1240,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     """
     Captures one image of the current sun position to be assembled into one analemma
     """
+    global meantranstimemoon # pylint: disable=W0603
     print(prefix+"Analemma Capture Time triggered")
     # Generate analemma subdirectory if this directory is not present and if the analemma parameter is specified
     analemmabase = args.dirname + "/analemma"
@@ -1411,13 +1415,14 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
             camera.set_control_value(controls[k]['ControlType'],
                                      currentsettings[k])
 
+    switchblock(False)
     print('Postprocessing HDR frames into HDR image')
     times = np.asarray(times, dtype=np.float32)
 
     # Estimate camera response
     calibrate = cv2.createCalibrateDebevec()
     # convert images from 16bit to 8bit since HDRI algorithm does not support 16bit images
-    for i in range(len(imgs)):
+    for i, img in enumerate(imgs):
         if imgs[i].dtype == np.uint16:
             imgs[i] = (imgs[i]/256).astype(np.uint8)
 
@@ -1448,7 +1453,6 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     args.metadata = orgmeta
 
     print(prefix+"Analemma HDR image processing finished")
-    switchblock(False)
 
 
 def turnOffMotors():
@@ -2219,22 +2223,39 @@ if args.analemma != '' or args.moonanalemma != '':
         analemmablock = analemmatrigger - datetime.timedelta(seconds=args.delayDaytime)
         print('Analemma Trigger Time in UTC: %s' % analemmatrigger.strftime("%H:%M:%S"))
         print('                      local : %s' % analemmatrigger.replace(tzinfo=datetime.timezone.utc).astimezone(tz=datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo).strftime("%H:%M:%S"))
-        scheduler.add_job(switchblock, trigger='cron', args=[True], hour=analemmablock.time().hour, minute=analemmablock.time().minute, second=analemmablock.time().second)
-        scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, pixelstorage, nparraytype, ''], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second)
+        scheduler.add_job(switchblock, trigger='cron', args=[True], hour=analemmablock.time().hour, minute=analemmablock.time().minute, second=analemmablock.time().second, id='sunblockexposure')
+        scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, pixelstorage, nparraytype, ''], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second, id='sunanalemmaexposure')
     if args.moonanalemma != '':
         # Calculate trigger UTC time from specified time difference to transit time
-        if args.moonanalemma.lower() == 'meridian':
+        if args.moonanalemma.lower() == 'meanmeridian':
             args.moonanalemma = 0.0
         else:
             args.moonanalemma = float(args.moonanalemma)
         moon = ephem.Moon()
         position.date = datetime.datetime.utcnow()
-        moonanalemmatrigger = position.next_transit(moon) + datetime.timedelta(hours=args.moonanalemma)
+        moonanalemmatrigger = position.next_transit(moon).datetime() + datetime.timedelta(hours=args.moonanalemma)
         moonanalemmablock = moonanalemmatrigger - datetime.timedelta(seconds=args.delay)
-        print('Moon Analemma Trigger Time in UTC: %s' % moonanalemmatrigger.strftime("%H:%M:%S"))
-        print('                           local : %s' % moonanalemmatrigger.replace(tzinfo=datetime.timezone.utc).astimezone(tz=datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo).strftime("%H:%M:%S"))
-        scheduler.add_job(switchblock, trigger='cron', args=[True], hour=moonanalemmablock.time().hour, minute=moonanalemmablock.time().minute, second=moonanalemmablock.time().second)
-        scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, pixelstorage, nparraytype, 'Moon'], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second)
+        triggerh = meantranstimemoon.seconds//3600
+        triggerm = meantranstimemoon.seconds//60
+        triggers = round((meantranstimemoon.seconds%3600)%60 + meantranstimemoon.microseconds/1000000)
+        print('Moon Analemma First Trigger Time in UTC: %s' % moonanalemmatrigger.strftime("%H:%M:%S"))
+        print('                                 local : %s' % moonanalemmatrigger.replace(tzinfo=datetime.timezone.utc).astimezone(tz=datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo).strftime("%H:%M:%S"))
+        print('Further trigger every: %d days, %d hours, %d minutes and %d seconds' % (meantranstimemoon.days, triggerh, triggerm, triggers))
+        #Set triggers to be started at fist determined transit time or moon meridian and then at intervals given by
+        #meantranstimemoon
+        #We have to convert the seconds property of the timedelta object meantransittimemoon into hours, minutes and seconds by
+        #integer division and modulo operations, since the property seconds denotes the total number of seconds per day (the number
+        #of days are separately given under the property days)
+        scheduler.add_job(switchblock, trigger='interval', args=[True],
+                          start_date=moonanalemmablock,
+                          days=meantranstimemoon.days,
+                          hours=triggerh, minutes=triggerm, seconds=triggers,
+                          id='moonblockexposure')
+        scheduler.add_job(getanalemma, trigger='interval', args=[args, camera, pixelstorage, nparraytype, 'Moon'],
+                          start_date=moonanalemmatrigger,
+                          days=meantranstimemoon.days,
+                          hours=triggerh, minutes=triggerm, seconds=triggers,
+                          id='moonanalemmaexposure')
 
 while bMain:
 
