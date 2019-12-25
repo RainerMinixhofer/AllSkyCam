@@ -7,6 +7,9 @@ Created on Wed Oct 31 07:28:18 2018
 @author: Rainer Minixhofer
 """
 # pylint: disable=C0301,C0302,C0103,R0914,R0912,R0915,R0913,R0902,R0903,W0123,W0702,W0621,W1401
+import matplotlib
+matplotlib.use('Agg')
+# pylint: disable=C0413,C0411
 import sys
 import argparse
 import os
@@ -25,16 +28,21 @@ import atexit
 import psutil
 import requests
 import numpy as np
+from scipy import optimize
 import metpy.calc as mcalc
 from metpy.units import units
-from pytz import utc # pylint: disable=E0401
-from astropy.io import fits # pylint: disable=E0401
+from pytz import utc
+from astropy.io import fits
+from skimage.feature import blob_doh
+from matplotlib import pyplot as plt # pylint: disable=C0412
+import matplotlib.patches as patches # pylint: disable=C0412
 import cv2 # pylint: disable=E0401
 import ephem # pylint: disable=E0401
 import smbus # pylint: disable=E0401
 import zwoasi as asi # pylint: disable=E0401
 from apscheduler.schedulers.background import BackgroundScheduler # pylint: disable=E0401
 from FriendlyELEC_NanoHatMotor import FriendlyELEC_NanoHatMotor as NanoHatMotor # pylint: disable=E0401
+# pylint: enable=C0413,C0411
 
 __author__ = 'Rainer Minixhofer'
 __version__ = '0.0.4'
@@ -163,14 +171,14 @@ def writeImage(filename, img, camera, args, timestring):
         exiftags['AllDates'] = timestring.strftime("%Y.%m.%d %H:%M:%S")
         exiftags['Artist'] = 'Rainer Minixhofer'
         exiftags['Country'] = 'Austria'
-        exiftags['Province'] = 'Styria'
+        exiftags['State'] = 'Styria'
         exiftags['City'] = 'Premstaetten'
         exiftags['Location'] = 'Premstaetten'
         exiftags['GPSLongitudeRef'] = 'W' if args.lon < 0 else 'E'
         exiftags['GPSLongitude'] = math.fabs(args.lon)
         exiftags['GPSLatitudeRef'] = 'S' if args.lat < 0 else 'N'
         exiftags['GPSLatitude'] = math.fabs(args.lat)
-        exiftags['GPSAltitudeRef'] = 1 if args.elevation < 0 else 0
+        exiftags['GPSAltitudeRef'] = 'Below' if args.elevation < 0 else 'Above'
         exiftags['GPSAltitude'] = math.fabs(args.elevation)
         # Change/update EXIF tags in file
         exifpars = ['/usr/bin/exiftool', '-config', '/home/rainer/.ExifTool_config', '-overwrite_original']
@@ -184,6 +192,39 @@ def writeImage(filename, img, camera, args, timestring):
             print('EXIFtool stderr: %s' % process.stderr)
     return status
 
+#Define 2D Gaussian Function for fitting through star blob data.
+
+def gaussian(height, center_x, center_y, sigma_x, sigma_y):
+    """Returns a gaussian function with the given parameters"""
+    sigma_x = float(sigma_x)
+    sigma_y = float(sigma_y)
+    return lambda x, y: height*np.exp(
+                -(((center_x-x)/sigma_x)**2+((center_y-y)/sigma_y)**2)/2)
+
+def moments(data):
+    """Returns (height, x, y, width_x, width_y)
+    the gaussian parameters of a 2D distribution by calculating its
+    moments """
+    total = data.sum()
+    X, Y = np.indices(data.shape)
+    x = (X*data).sum()/total
+    y = (Y*data).sum()/total
+    col = data[:, int(y)]
+    width_x = np.sqrt(np.abs((np.arange(col.size)-y)**2*col).sum()/col.sum())
+    row = data[int(x), :]
+    width_y = np.sqrt(np.abs((np.arange(row.size)-x)**2*row).sum()/row.sum())
+    height = data.max()
+    return height, x, y, width_x, width_y
+
+def fitgaussian(data):
+    """Returns (height, x, y, width_x, width_y)
+    the gaussian parameters of a 2D distribution found by a fit"""
+    params = moments(data)
+    errorfunction = lambda p: np.ravel(gaussian(*p)(*np.indices(data.shape)) -
+                                       data)
+    p, _ = optimize.leastsq(errorfunction, params)
+    return p
+
 def postprocess(args, camera):
     """
     does postprocessing of saved images and generates video, startrails and keogram
@@ -193,11 +234,93 @@ def postprocess(args, camera):
     dovideo = not args.video == "none"
     dostart = not args.startrailsoutput == "none"
     dokeogr = not args.keogramoutput == "none"
+    dofocus = not args.focusscale == ''
+    if dofocus:
+        #Get filenames of image files taken in focusscale
+        imgfiles = sorted(glob.glob(args.dirtime_12h_ago_path+"/"+args.filename[:-4]+"_focus_*."+args.extension))
+        sigma = 20
+        thresh = 0.02
+        indx = np.zeros(len(imgfiles))
+        width_x = np.zeros(len(imgfiles))
+        width_y = np.zeros(len(imgfiles))
+        for idx, imgfile in enumerate(imgfiles):
+            try:
+                img = cv2.imread(imgfile)
+                # Sometimes there is no error thrown by imread, but the img is still corrupted. This then
+                # shows up when taking statistics
+                imgstats = get_image_statistics(img)
+            except:
+                print("Error in readin image %s. Skipping to next file" % imgfile)
+                continue
+            #Focus scale index
+            indx[idx] = int(imgfile.split('.')[-3:])
+            #Detect blobs as candicates for focusing
+            blobs = blob_doh(img, max_sigma=sigma, threshold=thresh)
+            print('%d blobs found' % len(blobs))
+            if args.debug:
+                print(blobs[0, 0:2])
+            starblob = img[int(blobs[0, 0]-sigma):int(blobs[0, 0]-sigma)+2*sigma, int(blobs[0, 1]-sigma):int(blobs[0, 1]-sigma)+2*sigma]
+            #Fit selected blob with gaussian
+            params = fitgaussian(starblob)+[0, blobs[0, 0]-sigma, blobs[0, 1]-sigma, 0, 0]
+            fit = gaussian(*params)
+            # Create figure and axes
+            fig, ax = plt.subplots(1, figsize=(15, 15))
+            # Display the image
+            ax.imshow(img, cmap='gray')
+            ax.axis('off')
+            for blob in blobs:
+                y, x, r = blob
+                c = patches.Circle((x, y), r, color='red', linewidth=2, fill=False)
+                ax.add_patch(c)
+            # inset axes....
+            axins = ax.inset_axes([0.75, 0.75, 0.24, 0.24])
+            axins.imshow(img, interpolation="nearest", origin="lower")
+            axins.contour(fit(*np.indices(img.shape)), 6, cmap=plt.get_cmap('copper'))
+            (height, x, y, width_x[idx], width_y[idx]) = params
+
+            axins.text(0.95, 0.05, """
+            width_x : %.1f
+            width_y : %.1f""" %(width_x[idx], width_y[idx]),
+                       fontsize=16, horizontalalignment='right',
+                       verticalalignment='bottom', transform=axins.transAxes)
+            # sub region of the original image
+            x1, x2, y1, y2 = blobs[0, 1]-sigma, blobs[0, 1]+sigma, blobs[0, 0]-sigma, blobs[0, 0]+sigma
+            axins.set_xlim(x1, x2)
+            axins.set_ylim(y1, y2)
+            axins.set_xticklabels('')
+            axins.set_yticklabels('')
+
+            ax.indicate_inset_zoom(axins)
+
+            metadata = {
+                "Title" : "Focus-Scale #"+indx[idx],
+                "Author" : "Rainer Minixhofer",
+                "Description" : "Focus-Scale Image with different stepper motor setting",
+                "Copyright" : "All rights reserved by Rainer Minixhofer",
+                "Creation Time" : os.path.getmtime(imgfile),
+                "Software" : "Created by AllSkyCam.py script",
+                "Source" : "Taken by "+cameras_found[camera_id].split(' '),
+                "Comment" : ""
+                }
+
+            fig.savefig(imgfile, bbox_inches='tight', metadata=metadata)
+        plt.scatter(indx, width_x, color='r')
+        plt.scatter(indx, width_y, color='g')
+        plt.xlabel('Focus Scale')
+        plt.ylabel('Gaussian Width in x,y')
+        metadata["Title"] = "Focus-Scale Graph"
+        metadata["Description"] = "Graph of lead star gaussian widths in x and y coordinate over moved focal position"
+        metadata["Creation Time"] = datetime.datetime.now()
+        plt.savefig(args.dirtime_12h_ago_path+"/"+args.filename[:-4]+"_focusscale."+args.extension, bbox_inches='tight', metadata=metadata)
+
     if dovideo or dostart or dokeogr:
-        imgfiles = sorted(glob.glob(args.dirtime_12h_ago_path+"/"+args.filename[:-4]+"*."+args.extension))
+        imgfiles = sorted(glob.glob(args.dirtime_12h_ago_path+'/'+args.filename[:-4]+"*."+args.extension))
+        starttime = datetime.datetime.strptime(re.findall("\d+\.", imgfiles[0])[-1][:-1], '%Y%m%d%H%M%S')
+        prevtime = starttime
+        mask = None
         # Create array for startrail statistics
         if dostart:
-            stats = np.zeros((len(imgfiles), 3))
+            stats = np.zeros((len(imgfiles), 5))
 
         if dovideo:
             print("Exporting images to video")
@@ -211,30 +334,37 @@ def postprocess(args, camera):
                 # shows up when taking statistics
                 imgstats = get_image_statistics(image)
             except:
-                print("Error in readin image %s. Skipping to next file" % imgfile)
+                print("Error in reading image %s. Skipping to next file" % imgfile)
                 continue
             if dovideo:
                 vid.write(image)
             if dostart:
                 mean = imgstats['Mean']
-                # Save mean and standard deviation in statistics array
-                stats[idx] = [mean, imgstats['StdDev'], imgstats['Focus']]
+                # Save image time, time difference since first image and between previous and current image (both in hours), \
+                # mean and standard deviation of image in statistics array
+                curtime = datetime.datetime.strptime(re.findall("\d+\.", imgfile)[-1][:-1], '%Y%m%d%H%M%S')
+                diftime = (curtime - starttime).total_seconds()/3600
+                steptime = (curtime - prevtime).total_seconds()/3600
+                stats[idx] = [diftime, steptime, mean, imgstats['StdDev'], imgstats['Focus']]
                 # Add image to startrails image if mean is below threshold
                 if mean <= args.threshold:
                     status = 'Processing'
                     if startrails is None:
                         startrails = image.copy()
+                        startrails_tstart = curtime
                     else:
                         startrails = cv2.max(startrails, image)
+                        startrails_tend = curtime
                 else:
                     status = 'Skipping'
+                prevtime = curtime
             if dokeogr:
                 if keogram is None:
                     height, width, channels = image.shape
                     keogram = np.zeros((height, len(imgfiles), channels), image.dtype)
                 else:
                     keogram[:, idx] = image[:, width//2]
-                print('%s #%d / %d / %s / %6.4f' % (status, idx, len(imgfiles), os.path.basename(imgfile), mean))
+                print('%s #%d / %d / %s / %6.4f' % (status, idx+1, len(imgfiles), os.path.basename(imgfile), mean))
 
         if dovideo:
             vid.release()
@@ -260,6 +390,26 @@ def postprocess(args, camera):
             if startrails is None:
                 print('No images below threshold, writing the minimum image only')
                 startrails = cv2.imread(imgfiles[min_loc[1]], cv2.IMREAD_UNCHANGED)
+            else:
+                if mask == None:
+                    # If aperture should be masked, prepare circular mask array.
+                    # Define mask image of same size as image. It's needed for postprocessing
+                    # as well, so we do not make it dependent on args.maskaperture
+                    args.height, args.width, args.channels = startrails.shape
+                    mask = np.zeros((args.height, args.width, args.channels), dtype=startrails.dtype)
+                    #Define circle with origin in center of image and radius given by the smaller side of the image
+                    cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (1, 1, 1), -1)
+
+                #Apply mask to remove mangled labels
+                startrails *= mask
+                #Label time interval of startrails if args.time is set
+                if args.time:
+                    caption = "from " + startrails_tstart.strftime("%d.%b.%Y %X") + \
+                        "\nto " + startrails_tend.strftime("%d.%b.%Y %X")
+                    if args.text != "":
+                        caption = args.text + "\n" + caption
+                    _stamptext(startrails, caption, 0, args)
+
             startfile = args.dirtime_12h_ago_path+'/'+args.startrailsoutput[:-4]+args.dirtime_12h_ago+args.startrailsoutput[-4:]
             status = writeImage(startfile, startrails, camera, args, datetime.datetime.now())
 #            status = cv2.imwrite(startfile, startrails, args.fileoptions)
@@ -1235,6 +1385,7 @@ def switchblock(blockstate):
     """
     global blockimaging # pylint: disable=W0603
     blockimaging = blockstate
+    print('Block-State switched to ', blockimaging)
 
 def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     """
@@ -1397,7 +1548,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     for i, img in enumerate(imgs):
         print('Save %d frame of %d' % (i + 1, len(imgs)))
         # Define file base string (for image and image info file)
-        filebase = analemmabase+'/'+prefix.tolower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i])
+        filebase = analemmabase+'/'+prefix.lower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i])
         writeImage(filebase+'.'+args.extension, img, camera, args, datetime.datetime.now())
 
     print("Restoring camera settings to original values.")
@@ -1416,6 +1567,13 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
                                      currentsettings[k])
 
     switchblock(False)
+    generateHDR(args, camera, imgs, times, prefix)
+
+def generateHDR(args, camera, imgs, times, prefix):
+    """
+    Generates HDR images from LDR exposure sequence given in imgs with exposure times times
+    """
+    analemmabase = args.dirname + "/analemma"
     print('Postprocessing HDR frames into HDR image')
     times = np.asarray(times, dtype=np.float32)
 
@@ -1445,11 +1603,11 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     args.metadata = None
     fusion *= 255
     img = fusion.astype(np.uint8)
-    writeImage(analemmabase+'/'+prefix.tolower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'fusion.'+args.extension, img, camera, args, datetime.datetime.now())
+    writeImage(analemmabase+'/'+prefix.lower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'fusion.'+args.extension, img, camera, args, datetime.datetime.now())
     ldr *= 255
     img = ldr.astype(np.uint8)
-    writeImage(analemmabase+'/'+prefix.tolower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'ldr.'+args.extension, img, camera, args, datetime.datetime.now())
-    writeImage(analemmabase+'/'+prefix.tolower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'hdr.hdr', hdr, camera, args, datetime.datetime.now())
+    writeImage(analemmabase+'/'+prefix.lower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'ldr.'+args.extension, img, camera, args, datetime.datetime.now())
+    writeImage(analemmabase+'/'+prefix.lower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+'hdr.hdr', hdr, camera, args, datetime.datetime.now())
     args.metadata = orgmeta
 
     print(prefix+"Analemma HDR image processing finished")
@@ -2153,14 +2311,15 @@ imgarray = bytearray(args.width*args.height*pixelstorage)
 img = np.zeros((args.height, args.width, 3), nparraytype)
 args.dodebayer = (args.type == asi.ASI_IMG_RAW8 or args.type == asi.ASI_IMG_RAW16) and args.debayeralg != 'none'
 
-# If aperture should be masked, apply circular masking
 if args.maskaperture:
     print("Masking aperture")
-    #Define mask image of same size as image
+    # If aperture should be masked, prepare circular mask array.
+    # Define mask image of same size as image. It's needed for postprocessing
+    # as well, so we do not make it dependent on args.maskaperture
     mask = np.zeros((args.height, args.width, 3 if args.dodebayer else args.channels), dtype=nparraytype)
     #Define circle with origin in center of image and radius given by the smaller side of the image
-#    cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (255, 255, 255), -1)
     cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (1, 1, 1), -1)
+
 
 # If focusscale is run, initialize countdown variable for the number of images to take and initialize handler for focus stepper motor
 if args.focusscale != '':
@@ -2214,27 +2373,35 @@ if args.analemma != '' or args.moonanalemma != '':
     scheduler.start()
     if args.analemma != '':
         # Calculate trigger UTC time from mean local time
+        delay = args.delayDaytime/1000 # Time (in sec) to shift taking analemma pictures when now is specified and time difference to start blocking normal pictures in main loop
         if args.analemma.lower() == 'meanmidday':
-            args.analemma = '12:00:00'
-        if args.analemma.lower() != 'now':
-            analemmatrigger = lmt2utc(datetime.datetime.strptime(args.analemma, '%H:%M:%S'), position.lon)
+            analemmatrigger = lmt2utc(datetime.datetime.strptime('12:00:00', '%H:%M:%S'), position.lon)
+        elif args.analemma.lower() == 'now':
+            analemmatrigger = datetime.datetime.utcnow() + datetime.timedelta(seconds=10+delay) # ensure that the event happens after starting the script
         else:
-            analemmatrigger = datetime.datetime.utcnow() + datetime.timedelta(seconds=10+args.delayDaytime) # ensure that the event happens after starting the script
-        analemmablock = analemmatrigger - datetime.timedelta(seconds=args.delayDaytime)
+            analemmatrigger = lmt2utc(datetime.datetime.strptime(args.analemma, '%H:%M:%S'), position.lon)
+        analemmablock = analemmatrigger - datetime.timedelta(seconds=delay)
         print('Analemma Trigger Time in UTC: %s' % analemmatrigger.strftime("%H:%M:%S"))
         print('                      local : %s' % analemmatrigger.replace(tzinfo=datetime.timezone.utc).astimezone(tz=datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo).strftime("%H:%M:%S"))
         scheduler.add_job(switchblock, trigger='cron', args=[True], hour=analemmablock.time().hour, minute=analemmablock.time().minute, second=analemmablock.time().second, id='sunblockexposure')
         scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, pixelstorage, nparraytype, ''], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second, id='sunanalemmaexposure')
     if args.moonanalemma != '':
         # Calculate trigger UTC time from specified time difference to transit time
-        if args.moonanalemma.lower() == 'meanmeridian':
-            args.moonanalemma = 0.0
-        else:
-            args.moonanalemma = float(args.moonanalemma)
         moon = ephem.Moon()
         position.date = datetime.datetime.utcnow()
-        moonanalemmatrigger = position.next_transit(moon).datetime() + datetime.timedelta(hours=args.moonanalemma)
-        moonanalemmablock = moonanalemmatrigger - datetime.timedelta(seconds=args.delay)
+        # save Time (in sec) to shift taking analemma pictures when now is specified and time difference to start blocking normal pictures in main loop into variable delay
+        if isday(False):
+            delay = args.delayDaytime/1000
+        else:
+            delay = args.delay/1000
+        if args.moonanalemma.lower() == 'meanmeridian':
+            moonanalemmatrigger = position.next_transit(moon).datetime()
+        elif args.moonanalemma.lower() == 'now':
+            print('Take Moon analemma now')
+            moonanalemmatrigger = datetime.datetime.utcnow() + datetime.timedelta(seconds=10+delay) # ensure that the event happens after starting the script
+        else:
+            moonanalemmatrigger = position.next_transit(moon).datetime() + datetime.timedelta(hours=float(args.moonanalemma))
+        moonanalemmablock = moonanalemmatrigger - datetime.timedelta(seconds=delay)
         triggerh = meantranstimemoon.seconds//3600
         triggerm = meantranstimemoon.seconds//60
         triggers = round((meantranstimemoon.seconds%3600)%60 + meantranstimemoon.microseconds/1000000)
@@ -2476,7 +2643,10 @@ while bMain:
                             caption = 'Heater is OFF'
                         lasty = _stamptext(img, caption, lasty, dargs, left=False, top=True)
                 # write image
-                thread = saveThread(filebase+'.'+args.extension, img, camera, args, timestring)
+                if focuscounter == -1:
+                    thread = saveThread(filebase+'.'+args.extension, img, camera, args, timestring)
+                else:
+                    thread = saveThread(args.dirtime_12h_ago_path+'/'+args.filename[:-4]+'_focus_'+'{:02d}'.format(str(focuscounter))+'.'+args.extension, img, camera, args, timestring)
                 thread.start()
                 threads.append(thread)
 
@@ -2539,9 +2709,10 @@ dht22stopFlag.set()
 weatherstopFlag.set()
 IRSensorstopFlag.set()
 CurrentSensorstopFlag.set()
+turnoffHeater()
 
 # Finally wait for all threads to complete
-if args.analemma != '':
+if args.analemma != '' or args.moonanalemma != '':
     scheduler.shutdown()
 for t in threads:
     t.join()
