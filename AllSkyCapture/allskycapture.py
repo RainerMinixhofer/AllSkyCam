@@ -225,6 +225,45 @@ def fitgaussian(data):
     p, _ = optimize.leastsq(errorfunction, params)
     return p
 
+def _stamptext(img, caption, lasty, args, left=True, top=True):
+    """
+    renders the string <caption> on the image <img> under the last line at
+    position lasty (bottommost y-position for top=True and topmost y-position
+    for top=False) with the font parameters given in args. left and top specify
+    the four corners of the image for the caption lines (e.g. left=False,
+    top=True is the top right corner as a start point).
+    The line margins are taken from the args.textx parameter.
+    Depending on the value of args.ftfont the built in font Herhey of
+    version <args.fontname> is taken (if args.ftfont equals None) or a loaded
+    ttf font is used.
+    """
+    if args.ftfont is None:
+        (textboxwidth, textboxheight), baseline = cv2.getTextSize(caption, args.fontname, args.fontscale, args.fontlinethick)
+    else:
+        (textboxwidth, textboxheight), baseline = args.ftfont.getTextSize(caption, int(8*args.fontscale), args.fontlinethick)
+
+    if left:
+        textx = args.textx
+    else:
+        textx = args.width - args.textx - textboxwidth
+    if top:
+        texty = lasty + args.texty + textboxheight
+        lasty = texty + baseline
+    else:
+        texty = lasty - args.texty - baseline
+        lasty = texty - textboxheight
+    if args.ftfont is None:
+        cv2.putText(img, caption, (textx, texty), args.fontname, \
+                    args.fontscale, args.fontcolor, args.fontlinethick, \
+                    lineType=args.fontlinetype)
+    else:
+        args.ftfont.putText(img=img, text=caption, org=(textx, texty), \
+           fontHeight=int(8*args.fontscale), color=args.fontcolor, \
+           thickness=args.fontlinethick, line_type=args.fontlinetype, \
+           bottomLeftOrigin=True)
+    return lasty
+
+
 def postprocess(args, camera):
     """
     does postprocessing of saved images and generates video, startrails and keogram
@@ -315,6 +354,11 @@ def postprocess(args, camera):
 
     if dovideo or dostart or dokeogr:
         imgfiles = sorted(glob.glob(args.dirtime_12h_ago_path+'/'+args.filename[:-4]+"*."+args.extension))
+        #Get image dimensions and channels from first image
+        image = cv2.imread(imgfiles[0])
+        args.height, args.width, args.channels = image.shape
+        if args.debug:
+            print("Dimensions of first image: H=%d/W=%d/CH=%d" % (args.height, args.width, args.channels))
         starttime = datetime.datetime.strptime(re.findall("\d+\.", imgfiles[0])[-1][:-1], '%Y%m%d%H%M%S')
         prevtime = starttime
         mask = None
@@ -377,7 +421,13 @@ def postprocess(args, camera):
         if dostart:
 
             #Save Statistics
-            np.savetxt(args.dirtime_12h_ago_path+'/imgstatistics.txt', stats.transpose(), delimiter=',', fmt='%.4f', header='1st line:mean of image, 2nd line: StdDev of image, 3rd line: Focus of image')
+            np.savetxt(args.dirtime_12h_ago_path+'/imgstatistics.txt', stats.transpose(), \
+                       delimiter=',', fmt='%.4f', \
+                           header='1st line:time difference in hrs to start of night exposure, '\
+                                  '2nd line:step time difference in hrs between consecutive exposures, '\
+                                  '3rd line:mean of image, '\
+                                  '4th line:StdDev of image, '\
+                                  '5th line:Focus of image\nStart date and time:'+starttime.strftime("%d.%b.%Y %X"))
 
             #calculate some statistics for startrails: Min, Max, Mean and Median of Mean
             min_mean, max_mean, min_loc, _ = cv2.minMaxLoc(stats[:, 0])
@@ -390,29 +440,30 @@ def postprocess(args, camera):
             if startrails is None:
                 print('No images below threshold, writing the minimum image only')
                 startrails = cv2.imread(imgfiles[min_loc[1]], cv2.IMREAD_UNCHANGED)
-            else:
-                if mask == None:
-                    # If aperture should be masked, prepare circular mask array.
-                    # Define mask image of same size as image. It's needed for postprocessing
-                    # as well, so we do not make it dependent on args.maskaperture
-                    args.height, args.width, args.channels = startrails.shape
-                    mask = np.zeros((args.height, args.width, args.channels), dtype=startrails.dtype)
-                    #Define circle with origin in center of image and radius given by the smaller side of the image
-                    cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (1, 1, 1), -1)
 
-                #Apply mask to remove mangled labels
-                startrails *= mask
-                #Label time interval of startrails if args.time is set
-                if args.time:
-                    caption = "from " + startrails_tstart.strftime("%d.%b.%Y %X") + \
-                        "\nto " + startrails_tend.strftime("%d.%b.%Y %X")
-                    if args.text != "":
-                        caption = args.text + "\n" + caption
-                    _stamptext(startrails, caption, 0, args)
+            # If aperture should be masked, prepare circular mask array.
+            # Define mask image of same size as image. It's needed for postprocessing
+            # as well, so we do not make it dependent on args.maskaperture
+            mask = np.zeros((args.height, args.width, args.channels), dtype=startrails.dtype)
+            #Define circle with origin in center of image and radius given by the smaller side of the image
+            cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (1, 1, 1), -1)
+
+            #Apply mask to remove mangled labels
+            startrails *= mask
+            #Label time interval of startrails if args.time is set
+            if args.time:
+                print("Writing Caption to star trails")
+                caption = ["from " + startrails_tstart.strftime("%d.%b.%Y %X"), \
+                           "to   " + startrails_tend.strftime("%d.%b.%Y %X")]
+                if args.debug:
+                    print("Caption is: %s, %s" % (caption[0], caption[1]))
+                if args.text != "":
+                    caption = args.text + "\n" + caption
+                lasty = _stamptext(startrails, caption[0], 0, args)
+                lasty = _stamptext(startrails, caption[1], lasty, args)
 
             startfile = args.dirtime_12h_ago_path+'/'+args.startrailsoutput[:-4]+args.dirtime_12h_ago+args.startrailsoutput[-4:]
             status = writeImage(startfile, startrails, camera, args, datetime.datetime.now())
-#            status = cv2.imwrite(startfile, startrails, args.fileoptions)
             if args.serverrepo != 'none':
                 if '@' in args.serverrepo:
                     os.system("scp "+startfile+" "+args.serverrepo+"/")
@@ -730,27 +781,30 @@ def switchpin(pin, state=True):
     Switches state of <pin> to <state>
     """
     base = "/sys/class/gpio/gpio"+str(pin)
-    if state:
-        if not os.path.isdir(base):
-            f = open("/sys/class/gpio/export", "w")
-            f.write(str(pin))
+    try:
+        if state:
+            if not os.path.isdir(base):
+                f = open("/sys/class/gpio/export", "w")
+                f.write(str(pin))
+                f.close()
+            # give kernel time to create control files
+            time.sleep(0.5)
+            f = open(base + "/direction", "w")
+            f.write("out")
             f.close()
-        # give kernel time to create control files
-        time.sleep(0.1)
-        f = open(base + "/direction", "w")
-        f.write("out")
-        f.close()
-        f = open(base + "/value", "w")
-        f.write("1")
-        f.close()
-    else:
-        if os.path.isdir(base):
             f = open(base + "/value", "w")
-            f.write("0")
+            f.write("1")
             f.close()
-            f = open("/sys/class/gpio/unexport", "w")
-            f.write(str(pin))
-            f.close()
+        else:
+            if os.path.isdir(base):
+                f = open(base + "/value", "w")
+                f.write("0")
+                f.close()
+                f = open("/sys/class/gpio/unexport", "w")
+                f.write(str(pin))
+                f.close()
+    except:
+        print("Error in setting pin %d to state %s. Resuming operation..." % (pin, state))
 
 def pinstatus(pin):
     """
@@ -1567,9 +1621,9 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
                                      currentsettings[k])
 
     switchblock(False)
-    generateHDR(args, camera, imgs, times, prefix)
+    generateHDR(args, camera, imgs, times, timestring, prefix)
 
-def generateHDR(args, camera, imgs, times, prefix):
+def generateHDR(args, camera, imgs, times, timestring, prefix):
     """
     Generates HDR images from LDR exposure sequence given in imgs with exposure times times
     """
@@ -1675,45 +1729,6 @@ def is_number(s):
         pass
 
     return False
-
-def _stamptext(img, caption, lasty, args, left=True, top=True):
-    """
-    renders the string <caption> on the image <img> under the last line at
-    position lasty (bottommost y-position for top=True and topmost y-position
-    for top=False) with the font parameters given in args. left and top specify
-    the four corners of the image for the caption lines (e.g. left=False,
-    top=True is the top right corner as a start point).
-    The line margins are taken from the args.textx parameter.
-    Depending on the value of args.ftfont the built in font Herhey of
-    version <args.fontname> is taken (if args.ftfont equals None) or a loaded
-    ttf font is used.
-    """
-    if args.ftfont is None:
-        (textboxwidth, textboxheight), baseline = cv2.getTextSize(caption, args.fontname, args.fontscale, args.fontlinethick)
-    else:
-        (textboxwidth, textboxheight), baseline = args.ftfont.getTextSize(caption, int(8*args.fontscale), args.fontlinethick)
-
-    if left:
-        textx = args.textx
-    else:
-        textx = args.width - args.textx - textboxwidth
-    if top:
-        texty = lasty + args.texty + textboxheight
-        lasty = texty + baseline
-    else:
-        texty = lasty - args.texty - baseline
-        lasty = texty - textboxheight
-    if args.ftfont is None:
-        cv2.putText(img, caption, (textx, texty), args.fontname, \
-                    args.fontscale, args.fontcolor, args.fontlinethick, \
-                    lineType=args.fontlinetype)
-    else:
-        args.ftfont.putText(img=img, text=caption, org=(textx, texty), \
-           fontHeight=int(8*args.fontscale), color=args.fontcolor, \
-           thickness=args.fontlinethick, line_type=args.fontlinetype, \
-           bottomLeftOrigin=True)
-    return lasty
-
 
 parser = argparse.ArgumentParser(description='Process and save images from the AllSkyCamera')
 
@@ -2071,6 +2086,9 @@ parser.add_argument('--metadata',
                     images. If specified without parameter not metadata is written.\
                     (Default both text and exif is written.)')
 
+print("Script allskycapture.py started.")
+print("Parsing command line arguments")
+
 args = parser.parse_args()
 
 args.dirname = os.getcwd()
@@ -2133,6 +2151,9 @@ else:
     args.ftfont = None
     print('Builtin Hershey Font # %d specified' % args.fontname)
     args.fontname = int(args.fontname)
+
+print("Command line arguments parsed")
+
 position = ephem.Observer()
 position.pressure = 0
 position.lon = args.lon * math.pi / 180
@@ -2170,14 +2191,6 @@ else:
     print('Using #%d: %s' % (camera_id, cameras_found[camera_id]))
 
 camera = asi.Camera(camera_id)
-
-# Do postprocessing if postprocessonly is set and exit
-if args.postprocessonly:
-    args.dirtime_12h_ago_path = os.getcwd()
-    args.dirtime_12h_ago = os.path.basename(os.path.normpath(args.dirtime_12h_ago_path))
-    postprocess(args, camera)
-    camera.close()
-    exit()
 
 camera_info = camera.get_camera_property()
 print('Camera Properties:')
@@ -2338,6 +2351,14 @@ else:
 
 if args.metadata is not None:
     args.metadata = args.metadata.split(',')
+
+# Do postprocessing if postprocessonly is set and exit
+if args.postprocessonly:
+    args.dirtime_12h_ago_path = os.getcwd()
+    args.dirtime_12h_ago = os.path.basename(os.path.normpath(args.dirtime_12h_ago_path))
+    postprocess(args, camera)
+    camera.close()
+    exit()
 
 #Start Temperature and Humidity-Monitoring with DHT22 sensor. Read out every 5min (300sec) and timeout after 10sec
 
@@ -2517,10 +2538,12 @@ while bMain:
                 if not isday(False):
                     heaterControl(IRSensorthread.Tobj, weatherthread.dewpoint, sensitivity=1.5, hysteresis=5.0)
                 # read image as bytearray from camera
-                print("Starting Exposure")
-
+                print("Starting Exposure (looptime: 0 secs)")
+                reftime = datetime.datetime.now()
                 if args.debug:
-                    print("==>Memory before capture: %s percent. " % psutil.virtual_memory()[2])
+                    print("Exposure Start:")
+                    print("==>looptime: 0 secs")
+                    print("==>Memory  : %s %%" % psutil.virtual_memory()[2])
 
                 if exp_ms <= 100 and lastisday:
                     timeoutms = 200
@@ -2534,7 +2557,9 @@ while bMain:
                     print("Exposure timeout, increasing exposure time\n")
 
                 if args.debug:
-                    print("==>Memory after capture: %s percent. " % psutil.virtual_memory()[2])
+                    print("After frame capture:")
+                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 print("Stopping Exposure")
                 # read current camera parameters
@@ -2549,7 +2574,9 @@ while bMain:
                 nparray = np.frombuffer(imgarray, nparraytype)
 
                 if args.debug:
-                    print("==>Memory after nparray assignment: %s percent. " % psutil.virtual_memory()[2])
+                    print("After nparray assignment:")
+                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 # Debayer image in the case of RAW8 or RAW16 images
                 if args.dodebayer:
@@ -2563,22 +2590,30 @@ while bMain:
                     img = nparray.reshape((args.height, args.width, args.channels))
 
                     if args.debug:
-                        print("==>Memory after array reshaping: %s percent. " % psutil.virtual_memory()[2])
+                        print("After array reshaping:")
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 if args.debug:
-                    print("==>Memory after debayering: %s percent. " % psutil.virtual_memory()[2])
+                    print("After debayering:")
+                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 # postprocess image
                 # If aperture should be masked, apply circular masking
                 if args.maskaperture:
                     #Do mask operation
                     if args.debug:
-                        print("==>Memory before masking: %s percent. " % psutil.virtual_memory()[2])
+                        print("Before masking:")
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                     img *= mask
 
                     if args.debug:
-                        print("==>Memory after masking: %s percent. " % psutil.virtual_memory()[2])
+                        print("After masking:")
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 # If time parameter is specified, print timestring
                 #(in brackets if text parameter is given as well)
@@ -2588,11 +2623,11 @@ while bMain:
                 elif args.time:
                     caption = timestring.strftime("%d.%b.%Y %X")
                 print('Caption: %s' % caption)
-                if args.debug:
-                    print('Takedarkframe:', args.takedarkframe == '')
                 if args.takedarkframe == '':
                     if args.debug:
-                        print('Writing image caption')
+                        print('Writing image caption:')
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
                     lasty = _stamptext(img, caption, 0, args)
                     if args.details:
                         #Output into to left corner of the image underneath the Date-Time Caption
@@ -2642,7 +2677,16 @@ while bMain:
                         else:
                             caption = 'Heater is OFF'
                         lasty = _stamptext(img, caption, lasty, dargs, left=False, top=True)
+                        if args.debug:
+                            print("Image Caption written:")
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
                 # write image
+                if args.debug:
+                    print("Before image writing thread start:")
+                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
                 if focuscounter == -1:
                     thread = saveThread(filebase+'.'+args.extension, img, camera, args, timestring)
                 else:
@@ -2669,7 +2713,9 @@ while bMain:
                         myStepper.step(+focusstepwidth*focusframes, NanoHatMotor.BACKWARD, NanoHatMotor.INTERLEAVE)
 
                 if args.debug:
-                    print("==>Current memory utilization is %s percent. " % psutil.virtual_memory()[2])
+                    print("Before delay timestep:")
+                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    print("==>Current memory utilization is %s %%" % psutil.virtual_memory()[2])
 
                 if (args.autogain and not lastisday):
                     print("Auto Gain value: %d\n" % autoGain)
@@ -2689,8 +2735,16 @@ while bMain:
                     time.sleep(tsleep/1000.0)
                     print("Stop sleeping")
                 else:
-                    time.sleep(args.delayDaytime/1000.0 if lastisday else args.delay/1000.0)
-
+                    if lastisday:
+                        waittime = args.delayDaytime/1000.0-args.exposure/1000000
+                    else:
+                        waittime = args.delay/1000.0-args.exposure/1000000
+                    if waittime > 0:
+                        time.sleep(waittime)
+                if args.debug:
+                    print("At end of loop:")
+                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
                 if not(lastisday) and isday(False):
                     # Switch off heater
                     turnoffHeater()
