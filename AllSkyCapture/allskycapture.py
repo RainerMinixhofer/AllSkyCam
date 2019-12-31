@@ -264,6 +264,18 @@ def _stamptext(img, caption, lasty, args, left=True, top=True):
     return lasty
 
 
+def getmask(args, datatype):
+    """
+    # If aperture should be masked, prepare circular mask array.
+    # Define mask image of same size as image. It's needed for postprocessing
+    # as well, so we do not make it dependent on args.maskaperture
+    """
+    ellipsepars = ((args.xcmask, args.ycmask), (args.amask, args.bmask), args.elltheta)
+    mask = np.zeros((args.height, args.width, 3 if args.dodebayer else args.channels), dtype=datatype)
+    #Define circle with origin in center of image and radius given by the smaller side of the image
+    cv2.ellipse(mask, ellipsepars, (1, 1, 1), -1)
+    return mask
+
 def postprocess(args, camera):
     """
     does postprocessing of saved images and generates video, startrails and keogram
@@ -441,14 +453,8 @@ def postprocess(args, camera):
                 print('No images below threshold, writing the minimum image only')
                 startrails = cv2.imread(imgfiles[min_loc[1]], cv2.IMREAD_UNCHANGED)
 
-            # If aperture should be masked, prepare circular mask array.
-            # Define mask image of same size as image. It's needed for postprocessing
-            # as well, so we do not make it dependent on args.maskaperture
-            mask = np.zeros((args.height, args.width, args.channels), dtype=startrails.dtype)
-            #Define circle with origin in center of image and radius given by the smaller side of the image
-            cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (1, 1, 1), -1)
-
             #Apply mask to remove mangled labels
+            mask = getmask(args, startrails.dtype)
             startrails *= mask
             #Label time interval of startrails if args.time is set
             if args.time:
@@ -1441,24 +1447,41 @@ def switchblock(blockstate):
     blockimaging = blockstate
     print('Block-State switched to ', blockimaging)
 
-def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
+def savecamerasettings(camera):
     """
-    Captures one image of the current sun position to be assembled into one analemma
+    saves current camera settings and returns dictionary listing them
     """
-    global meantranstimemoon # pylint: disable=W0603
-    print(prefix+"Analemma Capture Time triggered")
-    # Generate analemma subdirectory if this directory is not present and if the analemma parameter is specified
-    analemmabase = args.dirname + "/analemma"
-    if not os.path.isdir(analemmabase):
-        try:
-            os.mkdir(analemmabase)
-        except OSError:
-            print("Creation of the analemma subdirectory %s failed" % analemmabase)
-    # Get current time
-    timestring = datetime.datetime.now()
+    print("Saving current camera settings.")
+    return camera.get_control_values()
 
-    # Save camera settings to apply after HDR capture
-    currentsettings = camera.get_control_values()
+def restorecamerasettings(args, camera, settings):
+    """
+    applies camera settings given in settings dictionary
+    """
+    print("Restoring camera settings to original values.")
+
+    controls = camera.get_controls()
+
+    for k in sorted(camera.get_control_values().keys()):
+        if k == 'Exposure':
+            camera.set_control_value(controls[k]['ControlType'],
+                                     settings[k],
+                                     auto=args.autoexposure)
+        elif k == 'Gain':
+            camera.set_control_value(controls[k]['ControlType'],
+                                     settings[k],
+                                     auto=args.autogain)
+        else:
+            camera.set_control_value(controls[k]['ControlType'],
+                                     settings[k])
+
+
+def getexposureoptimum(args, camera):
+    """
+    returns autoexposure value in us
+    """
+    # Save camera settings to apply at routine end
+    currentsettings = savecamerasettings(camera)
 
     # Use autoexposure for first analemma image
 
@@ -1477,8 +1500,8 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     width //= 2
     height //= 2
     # ensure that conditions for ROI width and height are met
-    width -= width % 8
-    height -= height % 2
+    width = closestDivisibleInteger(width, 8)
+    height = closestDivisibleInteger(height, 2)
 
     # with start_x and start_y as None, the ROI is centered in the FOV
     camera.set_roi(start_x=None, start_y=None, width=width, height=height)
@@ -1509,13 +1532,12 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     matches = 0
     while True:
         time.sleep(sleep_interval)
-        settings = camera.get_control_values()
         df = camera.get_dropped_frames()
-        autoex = settings['Exposure']
+        autoex = camera.get_control_values()['Exposure']
         if df != df_last:
             if args.debug:
                 print('   Exposure: {autoex:f} \u03BCs Dropped frames: {df:d}'
-                      .format(autoex=settings['Exposure'], df=df))
+                      .format(autoex=autoex, df=df))
             if autoex == autoex_last:
                 matches += 1
             else:
@@ -1527,15 +1549,38 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
 
     print("Final autoexposure: %d \u03BCs" % autoex)
 
-    # read image as bytearray from camera
-    print("Starting "+prefix+"Analemma HDR capture\n")
-
     camera.stop_video_capture()
     camera.stop_exposure()
 
     # reset ROI
     camera.set_roi(start_x=origroi[0], start_y=origroi[1],
                    width=origroi[2], height=origroi[3])
+    restorecamerasettings(args, camera, currentsettings)
+
+    return autoex
+
+def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
+    """
+    Captures one image of the current sun position to be assembled into one analemma
+    """
+    global meantranstimemoon # pylint: disable=W0603
+    print(prefix+"Analemma Capture Time triggered")
+    # Generate analemma subdirectory if this directory is not present and if the analemma parameter is specified
+    analemmabase = args.dirname + "/analemma"
+    if not os.path.isdir(analemmabase):
+        try:
+            os.mkdir(analemmabase)
+        except OSError:
+            print("Creation of the analemma subdirectory %s failed" % analemmabase)
+    # Get current time
+    timestring = datetime.datetime.now()
+
+    autoex = getexposureoptimum(args, camera)
+
+    print("Autoexposure setting: %d \u03BCs" % autoex)
+
+    # read image as bytearray from camera
+    print("Starting "+prefix+"Analemma HDR capture\n")
 
     imgs = []
 
@@ -1550,7 +1595,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
 
     while autoex >= controls['Exposure']['MinValue']:
         times.append(autoex)
-        autoex //= 2 # Scale exposure by % 2 for HDR scale
+        autoex //= 2 # Scale exposure by 2 for HDR scale
     if times[-1] != controls['Exposure']['MinValue']:
         times.append(controls['Exposure']['MinValue'])
     # Start with smallest exposure time
@@ -1587,7 +1632,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
 
         # postprocess image
         # If aperture should be masked, apply circular masking
-        if args.maskaperture:
+        if args.maskaperture != False:
             #Do mask operation
             img *= mask
 
@@ -1604,21 +1649,6 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
         # Define file base string (for image and image info file)
         filebase = analemmabase+'/'+prefix.lower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i])
         writeImage(filebase+'.'+args.extension, img, camera, args, datetime.datetime.now())
-
-    print("Restoring camera settings to original values.")
-
-    for k in sorted(settings.keys()):
-        if k == 'Exposure':
-            camera.set_control_value(controls[k]['ControlType'],
-                                     currentsettings[k],
-                                     auto=args.autoexposure)
-        elif k == 'Gain':
-            camera.set_control_value(controls[k]['ControlType'],
-                                     currentsettings[k],
-                                     auto=args.autogain)
-        else:
-            camera.set_control_value(controls[k]['ControlType'],
-                                     currentsettings[k])
 
     switchblock(False)
     generateHDR(args, camera, imgs, times, timestring, prefix)
@@ -1666,6 +1696,139 @@ def generateHDR(args, camera, imgs, times, timestring, prefix):
 
     print(prefix+"Analemma HDR image processing finished")
 
+def getaperture(args, camera, configfile, overexposure=10, threshold=128, minfeaturesize=20):
+    """
+    Returns aperture data in form of ellipse data and bounding box
+    """
+    # Get optimum of exposure and multiply this value by 10x to get good overexposure
+    print("Getting aperture dimensions from overexposed image")
+    exposure = int(overexposure*getexposureoptimum(args, camera))
+
+    # Set maximum ROI for aperture extraction
+    origroi = camera.get_roi()
+    camera.set_roi(start_x=None, start_y=None, width=maxwidth, height=maxheight)
+
+    imgarray = bytearray(maxwidth*maxheight*pixelstorage)
+
+    # Do loop over exposures scaling them with a factor of 2
+
+    camera.set_control_value(controls['Gain']['ControlType'], 1)
+    camera.set_control_value(controls['Exposure']['ControlType'], exposure, auto=False)
+
+    camera.capture(buffer_=imgarray, filename=None)
+
+    print("Exposure setting: %d us" % exposure)
+
+    # convert bytearray to numpy array
+    nparray = np.frombuffer(imgarray, nparraytype)
+    # reshape numpy array back to image matrix depending on image type.
+    imgbay = nparray.reshape((maxheight, maxwidth, args.channels))
+
+    # Debayer image in the case of RAW8 or RAW16 images
+    if args.dodebayer:
+        # Define image array here, to ensure that an image array is generated with imgs.append below
+        img = np.zeros((maxheight, maxwidth, 3), nparraytype)
+        # take care that opencv channel order is B,G,R instead of R,G,B
+        cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+\
+                                  bayerpatt[bayerindx][2:][::-1]+\
+                                  '2BGR'+debayeralgext), img, 0)
+    else:
+        img = np.copy(imgbay)
+    if args.debug:
+        cv2.imwrite(args.dirname+'/aperture_orig.png', img)
+    #convert into 8bit grayscale image
+    im_th = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if nparraytype == 'uint16':
+        im_th = (im_th/256).astype('uint8')
+    #convert grayscale image to a binary image with threshold set to 97
+    _, im_th = cv2.threshold(im_th, threshold, 255, cv2.THRESH_BINARY)
+    #remove small features outside the aperture by opening operation
+    im_th = cv2.morphologyEx(im_th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (minfeaturesize, minfeaturesize)))
+    im = im_th.copy()
+    if args.debug:
+        cv2.imwrite(args.dirname+'/aperture_th.png', im_th)
+
+    #flood fill outer area
+    h, w = im.shape[:2]
+    imask = np.zeros((h+2, w+2), np.uint8)
+    cv2.floodFill(im, imask, (0, 0), 255)
+    # Invert floodfilled image
+    im_inv = cv2.bitwise_not(im)
+    # Combine the two images to get the aperture.
+    im = im_th | im_inv
+    # Find contours (only most external)
+    cnts, _ = cv2.findContours(im, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    # Get bounding boxes of contours found
+    bboxareas = []
+    for curve in cnts:
+        bboxareas.append(np.prod(cv2.boundingRect(curve)[2:]))
+        print("Bbox Area: ", bboxareas[-1])
+
+    # Sort found contours after area of their bounding boxes, because of lens
+    # flares, the algorithm would most probably find another smaller feature
+    # in the flares instead of the real aperture
+    # The contour with the largest bounding box is then in the last element of cnts
+    cntbbox = zip(bboxareas, cnts)
+    cnts = [x for _, x in sorted(cntbbox)]
+
+    image = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
+
+    # Draw found contour(s) in input image
+    image = cv2.drawContours(image, cnts, -1, (0, 255, 0), 2)
+
+    # Fit Ellipse through found contour
+    ellipse = cv2.fitEllipse(cnts[-1])
+    # Get Bounding box (non-rotated) from contour
+    contours_poly = cv2.approxPolyDP(cnts[-1], 3, True)
+    boundRect = cv2.boundingRect(contours_poly)
+
+    # Draw ellipse in image
+    image = cv2.ellipse(image, ellipse, (0, 0, 255), 5)
+
+    # reset ROI
+    camera.set_roi(start_x=origroi[0], start_y=origroi[1],
+                   width=origroi[2], height=origroi[3])
+
+    # Save aperture for debugging reasons
+    if args.debug:
+        cv2.imwrite(args.dirname+'/aperture.png', image)
+    # Save parameters into configfile
+    filename = args.dirname+'/'+configfile
+    with open(filename, 'w') as f:
+        f.write('%.2f, %.2f\n' % (ellipse[0][0], ellipse[0][1]))
+        f.write('%.2f, %.2f\n' % (ellipse[1][0], ellipse[1][1]))
+        f.write('%.2f\n\n' % ellipse[2])
+        for par in boundRect:
+            f.write('%d ' % par)
+        f.write('\n')
+    f.close()
+    print('Aperture parameters saved to %s' % filename)
+
+    print("Ellipse parameters:")
+    print(" xc, yc = %.2f, %.2f" % (ellipse[0][0], ellipse[0][1]))
+    print(" a, b   = %.2f, %.2f" % (ellipse[1][0], ellipse[1][1]))
+    print(" Theta  = %.2f" % ellipse[2])
+    print("Bounding Box:")
+    print(" x0, y0 = %d, %d" % (boundRect[0], boundRect[1]))
+    print(" w , h  = %d, %d" % (boundRect[2], boundRect[3]))
+    return ellipse, boundRect
+
+def getPIDcontrolvalue(ts, e, kc=1, ti=None, td=None):
+    """
+    PID control implementation according to Rossi2012
+    If ti==None a PD controller is specified
+    If td==None a PI controller is specified
+    If ti and td are equal to None (default) a P controller is specified
+    """
+    q = np.empty(3)
+    if td is None:
+        td = 0
+    q[2] = +kc*(1+td/ts)
+    q[1] = -kc*(1+2*td/ts)
+    if ti is not None:
+        q[1] += kc*ts/ti
+    q[0] = +kc*td/ts
+    return np.dot(e, q)
 
 def turnOffMotors():
     """
@@ -1730,6 +1893,16 @@ def is_number(s):
 
     return False
 
+def closestDivisibleInteger(x, div):
+    """
+    Find integer closest to the integer x which is divisible by div
+    """
+    res1 = x - (x % div)
+    res2 = (x + div) - (x % div)
+    if x - res1 > res2 - x:
+        return res2
+    return res1
+
 parser = argparse.ArgumentParser(description='Process and save images from the AllSkyCamera')
 
 # Argument to specify location of ASI SDK Library (default specified in env_filename
@@ -1743,7 +1916,7 @@ parser.add_argument('--camnr',
                     default=0,
                     type=check_nonnegative_int,
                     help='Specify number of camera to use (when multiple cameras are attached)')
-# Width and Height of final image capture size (default is maximum width and height)
+# Width and Height of final image capture size
 parser.add_argument('--width',
                     default=1808,
                     type=check_positive_int,
@@ -1752,7 +1925,7 @@ parser.add_argument('--height',
                     default=1808,
                     type=check_positive_int,
                     help='Height of final image capture (0 if maximum height should be selected)')
-# Top and left position of final image capture (default is)
+# Top and left position of final image capture
 parser.add_argument('--left',
                     default=700,
                     type=check_nonnegative_int,
@@ -1983,8 +2156,17 @@ parser.add_argument('--time',
                     help='Adds time info to image. Use textx and texty for placement.')
 # Mask areas outside aperture circle
 parser.add_argument('--maskaperture',
-                    action='store_true',
-                    help='Does circular aperture masking outside of circle filling ROI.')
+                    nargs='?',
+                    const='LTWH',
+                    default=False,
+                    help='Does circular or elliptical aperture masking outside field of view. \
+                        If a parameter is specified, this parameter is taken as filename giving \
+                        the parameters of an aperture ellipse. This file is generated by the \
+                        getaperture parameter and is usually named "config.txt". \
+                        If no parameter is specified, the parameters left, top, width and height \
+                        are used to define a circular aperture. \
+                        We get the same behaviour if we specify the string "LTWH" \
+                        (default: "LTWH")')
 # Daytime capture setting
 parser.add_argument('--daytime',
                     action='store_true',
@@ -2086,6 +2268,23 @@ parser.add_argument('--metadata',
                     images. If specified without parameter not metadata is written.\
                     (Default both text and exif is written.)')
 
+# Get aperture dimensions
+parser.add_argument('--getaperture',
+                    default='',
+                    const='config.txt,10,128,20',
+                    nargs='?',
+                    type=str,
+                    help='If specified, an overexposed image is taken. From this image the aperture is \
+                        extracted using image thresholding and filling. The result is written \
+                        into the file specified as the first optional parameter. The second, third and fourth \
+                        parameters are the overexposure factor, the threshold for binarizing the 8bit image \
+                        and the minimum feature size of the contours extracted respectively. \
+                        This option should be run under diffuse light conditions, since lens flares at \
+                        intense sunlight could disturb the aperture extraction. \
+                        Check the ellipse parameters axes after the extraction, they should \
+                        be in the range of 1700x1700 pixels, otherwise a wrong contour has been extracted \
+                        (if specified without parameter "config.txt,10,128,20" is taken)')
+
 print("Script allskycapture.py started.")
 print("Parsing command line arguments")
 
@@ -2151,6 +2350,21 @@ else:
     args.ftfont = None
     print('Builtin Hershey Font # %d specified' % args.fontname)
     args.fontname = int(args.fontname)
+print('Mask aperture parameter is:',args.maskaperture)
+if args.maskaperture not in ['LTWH', False]:
+    f = open(os.getcwd()+'/'+args.maskaperture, 'r')
+    lines = f.readlines()
+    line = lines[0].strip().split(', ')
+    line = lines[1].strip().split(', ')
+    args.amask, args.bmask = float(line[0]), float(line[1])
+    args.elltheta = float(lines[2].strip())
+    line = lines[4].strip().split(' ')
+    args.left, args.top, args.width, args.height = int(line[0]), int(line[1]), int(line[2]), int(line[3])
+elif args.maskaperture == 'LTWH':
+    args.amask = args.bmask = min([args.width, args.height])
+    args.elltheta = 0
+else:
+    args.amask = args.bmask = 0
 
 print("Command line arguments parsed")
 
@@ -2236,9 +2450,11 @@ if args.width == 0:
 
 # Adjust variables to chosen binning
 args.height //= args.bin
-args.height -= args.height % 2
 args.width //= args.bin
-args.width -= args.width % 8
+# The ROI settings for width and height have hardware constraints
+# Width must be divisable by 8 and height by 2
+args.height = closestDivisibleInteger(args.height, 2)
+args.width = closestDivisibleInteger(args.width, 8)
 if args.left is None:
     args.left = (maxwidth//args.bin - args.width) // 2
 else:
@@ -2247,6 +2463,11 @@ if args.top is None:
     args.top = (maxheight//args.bin - args.height) // 2
 else:
     args.top //= args.bin
+
+args.xcmask, args.ycmask = [args.width//2, args.height//2]
+args.amask //= args.bin
+args.bmask //= args.bin
+
 args.textx //= args.bin
 args.texty //= args.bin
 args.fontscale /= args.bin
@@ -2315,24 +2536,18 @@ camera.set_control_value(asi.ASI_BRIGHTNESS, args.brightness)
 camera.set_control_value(asi.ASI_FLIP, args.flip)
 
 currentExposure = args.exposure
-exp_ms = 0
 autoGain = 0
 autoExp = 0
+histmu = np.zeros(3)
 
 # get bytearray for buffer to store image
 imgarray = bytearray(args.width*args.height*pixelstorage)
 img = np.zeros((args.height, args.width, 3), nparraytype)
-args.dodebayer = (args.type == asi.ASI_IMG_RAW8 or args.type == asi.ASI_IMG_RAW16) and args.debayeralg != 'none'
+args.dodebayer = (args.type == asi.ASI_IMG_RAW8 or args.type == asi.ASI_IMG_RAW16) and (args.debayeralg != 'none' or args.getaperture != '')
 
-if args.maskaperture:
+if args.maskaperture != False:
     print("Masking aperture")
-    # If aperture should be masked, prepare circular mask array.
-    # Define mask image of same size as image. It's needed for postprocessing
-    # as well, so we do not make it dependent on args.maskaperture
-    mask = np.zeros((args.height, args.width, 3 if args.dodebayer else args.channels), dtype=nparraytype)
-    #Define circle with origin in center of image and radius given by the smaller side of the image
-    cv2.circle(mask, (args.width//2, args.height//2), min([args.width//2, args.height//2]), (1, 1, 1), -1)
-
+    mask = getmask(args, nparraytype)
 
 # If focusscale is run, initialize countdown variable for the number of images to take and initialize handler for focus stepper motor
 if args.focusscale != '':
@@ -2358,6 +2573,16 @@ if args.postprocessonly:
     args.dirtime_12h_ago = os.path.basename(os.path.normpath(args.dirtime_12h_ago_path))
     postprocess(args, camera)
     camera.close()
+    exit()
+
+# Get Aperture dimensions and save it into configuration file given by getaperture parameter
+if args.getaperture != '':
+    # Ignore default debayer algorithm setting, we should always debayer to get a correct grayscale image afterwards
+    args.debayeralg = 'bl'
+    debayeralgext = ''
+    configfile, overexposure, threshold, minfeaturesize = args.getaperture.split(',')
+
+    getaperture(args, camera, configfile, overexposure=float(overexposure), threshold=int(threshold), minfeaturesize=int(minfeaturesize))
     exit()
 
 #Start Temperature and Humidity-Monitoring with DHT22 sensor. Read out every 5min (300sec) and timeout after 10sec
@@ -2502,7 +2727,6 @@ while bMain:
                 print("Saving auto exposed images every %d ms\n\n" % args.delay)
             elif lastisday: # at day always autoexposure
                 print("Saving auto exposed images every %d ms\n\n" % args.delayDaytime)
-                exp_ms = 32
             else: # constant exposure at night
                 print("Saving %d s exposure images every %d ms\n\n" % (currentExposure/1000000.0,\
                                                                         args.delay))
@@ -2518,7 +2742,7 @@ while bMain:
             else:
                 print("Starting night time capture\n")
 
-            # start video capture
+            # Stop and running image or video capture
             try:
                 # Force any single exposure to be halted
                 camera.stop_video_capture()
@@ -2527,8 +2751,6 @@ while bMain:
                 raise
             except:
                 pass
-
-            camera.start_video_capture()
 
             while bMain and lastisday == isday(False):
 
@@ -2541,31 +2763,22 @@ while bMain:
                 print("Starting Exposure (looptime: 0 secs)")
                 reftime = datetime.datetime.now()
                 if args.debug:
-                    print("Exposure Start:")
+                    print("-----------------------------------------")
+                    print("Before frame readout:")
                     print("==>looptime: 0 secs")
                     print("==>Memory  : %s %%" % psutil.virtual_memory()[2])
 
-                if exp_ms <= 100 and lastisday:
-                    timeoutms = 200
-                elif lastisday:
-                    timeoutms = exp_ms*2
-                else:
-                    timeoutms = None
                 try:
-                    camera.capture_video_frame(buffer_=imgarray, filename=None, timeout=timeoutms)
+                    camera.capture(buffer_=imgarray, filename=None)
                 except:
                     print("Exposure timeout, increasing exposure time\n")
 
                 if args.debug:
-                    print("After frame capture:")
+                    print("After frame readout:")
                     print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
                     print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 print("Stopping Exposure")
-                # read current camera parameters
-                autoExp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
-                print("Autoexposure: %d us" % autoExp)
-                autoGain = camera.get_control_value(asi.ASI_GAIN)[0]
                 # Get current time
                 timestring = datetime.datetime.now()
                 # Define file base string (for image and image info file)
@@ -2599,9 +2812,38 @@ while bMain:
                     print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
                     print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
+                # read current camera parameters
+                autoExp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
+                autoGain = camera.get_control_value(asi.ASI_GAIN)[0]
+
+                # Adjust exposure and gain if autoexp or autogain has been set respectively
+                if args.autoexposure:
+                    autoExp = getexposureoptimum(args, camera)
+                if args.autogain:
+                    # calculate histogram from image converted into grayscale
+                    gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).astype('uint8')
+                    hist = cv2.calcHist([gray], [0], (cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)).astype('uint8'), [256], [0, 255])
+                    cv2.normalize(hist, hist, alpha=0, beta=1.0, norm_type=cv2.NORM_MINMAX)
+                    # Get exposure measure by calculating skew around middle gray (128) => See Chen2017.pdf
+                    np.roll(histmu, -1)
+                    histmu[2] = 0
+                    for k, p in enumerate(hist):
+                        histmu[2] += (k-128)**3*p
+                    if args.debug:
+                        print("Auto Gain score: %.2f" % histmu[2])
+                    print("Auto Gain score: %.2f" % histmu[2])
+                    #Implement PI control (see Rossi2012)
+                    autoGainstep = -int(getPIDcontrolvalue(args.delayDaytime if lastisday else args.delay, histmu, kc=1/200000))
+                    print("Auto Gain step: %d" % autoGainstep)
+                    autoGain += autoGainstep
+                    if autoGain > args.maxgain:
+                        autoGain = args.maxgain
+                    if autoGain < 0:
+                        autoGain = 0
+
                 # postprocess image
                 # If aperture should be masked, apply circular masking
-                if args.maskaperture:
+                if args.maskaperture != False:
                     #Do mask operation
                     if args.debug:
                         print("Before masking:")
@@ -2644,28 +2886,28 @@ while bMain:
                         caption = str('Gain {:d}'.format(autoGain))
                         lasty = _stamptext(img, caption, lasty, dargs)
                         #Output into the bottom left corner of the image
-                        caption = str('Dew Point {:.1f}degC'.\
+                        caption = str('TDew {:.1f}degC'.\
                                  format(weatherthread.dewpoint))
                         lasty = _stamptext(img, caption, dargs.height, dargs, top=False)
-                        caption = str('External Temp. {:.1f}degC'.\
+                        caption = str('TExt {:.1f}degC'.\
                                  format(weatherthread.temperature))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('Dome Temp. {:.1f}degC'.\
+                        caption = str('TDome {:.1f}degC'.\
                                  format(IRSensorthread.Tobj))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('IR Amb. Temp. {:.1f}degC'.\
+                        caption = str('TIRAmb {:.1f}degC'.\
                                  format(IRSensorthread.Ta))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('Housing Temp. {:.1f}degC'.\
+                        caption = str('THouse {:.1f}degC'.\
                                  format(dht22thread.dht22temp))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('Housing Dew Point {:.1f}degC'.\
+                        caption = str('TDewHouse {:.1f}degC'.\
                                  format(dht22thread.dewpoint))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('Housing Hum. {:.1f}%'.\
+                        caption = str('RHHouse {:.1f}%'.\
                                  format(dht22thread.dht22hum))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('External Hum. {:.1f}%'.\
+                        caption = str('RHExt {:.1f}%'.\
                                  format(weatherthread.humidity))
                         lasty = _stamptext(img, caption, lasty, dargs, top=False)
                         #Output into the top right corner of the image
@@ -2717,34 +2959,32 @@ while bMain:
                     print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
                     print("==>Current memory utilization is %s %%" % psutil.virtual_memory()[2])
 
-                if (args.autogain and not lastisday):
+                if args.autogain:
                     print("Auto Gain value: %d\n" % autoGain)
-                if (args.autoexposure and not lastisday):
-                    print("Auto Exposure value: %d ms\n" % round(autoExp/1000))
+                    camera.set_control_value(asi.ASI_GAIN, autoGain, auto=True)
 
-                    # Apply delay before next exposure
-                    if autoExp < args.maxexposure*1000:
-                        # if using auto-exposure and the actual exposure is less than the max,
-                        # we still wait until we reach maxesposure.
-                        # This is important for a constant frame rate during timelapse generation
-#                        tsleep=(args.maxexposure - autoExp/1000.0 + args.delay) # in ms
-                        tsleep = (args.maxexposure + args.delay) # in ms
-                        print("Sleeping %d ms\n" % tsleep)
-                    else:
-                        tsleep = args.delay # in ms
-                    time.sleep(tsleep/1000.0)
-                    print("Stop sleeping")
+                if args.autoexposure:
+                    print("Auto Exposure value: %d ms\n" % round(autoExp/1000))
+                    camera.set_control_value(asi.ASI_EXPOSURE, autoExp, auto=True)
+
+                # if the actual time elapsed since start of the loop is less
+                # than the delay or delayDaytime parameter,
+                # we still wait until we reach the required time elapsed.
+                # This is important for a constant frame rate during timelapse generation
+                timediff = (datetime.datetime.now()-reftime).total_seconds()
+                if lastisday:
+                    waittime = args.delayDaytime/1000.0-timediff
                 else:
-                    if lastisday:
-                        waittime = args.delayDaytime/1000.0-args.exposure/1000000
-                    else:
-                        waittime = args.delay/1000.0-args.exposure/1000000
-                    if waittime > 0:
-                        time.sleep(waittime)
+                    waittime = args.delay/1000.0-timediff
+                if waittime > 0:
+                    print("Sleeping %.2f s\n" % waittime)
+                    time.sleep(waittime)
                 if args.debug:
                     print("At end of loop:")
                     print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
                     print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                    print("-----------------------------------------")
+
                 if not(lastisday) and isday(False):
                     # Switch off heater
                     turnoffHeater()
