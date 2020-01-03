@@ -6,7 +6,7 @@ Created on Wed Oct 31 07:28:18 2018
 
 @author: Rainer Minixhofer
 """
-# pylint: disable=C0301,C0302,C0103,R0914,R0912,R0915,R0913,R0902,R0903,W0123,W0702,W0621,W1401
+# pylint: disable=C0301,C0302,C0103,R0914,R0912,R0915,R0913,R0902,R0903,R1702,W0123,W0702,W0621,W1401
 import matplotlib
 matplotlib.use('Agg')
 # pylint: disable=C0413,C0411
@@ -23,7 +23,7 @@ import datetime
 import threading
 import glob
 import copy
-from shutil import rmtree
+import shutil
 import atexit
 import psutil
 import requests
@@ -90,7 +90,10 @@ def save_control_values(filename, settings, params):
             f.write('%s: %s\n' % (k, str(params[k])))
     print('Camera settings saved to %s' % filename)
     #Write Camera Focus measure into Homematic
-    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22416&new_value="+"{:.4f}".format(params["Focus"]))
+    try:
+        r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22416&new_value="+"{:.4f}".format(params["Focus"]))
+    except ConnectionError:
+        print("Data could not be written into the Homematic system variables.")
     if r.status_code != requests.codes['ok']:
         print("Data could not be written into the Homematic system variables.")
 
@@ -107,8 +110,10 @@ def get_image_statistics(img):
         mmean /= 255.0
     elif img.dtype.name == 'uint16':
         mmean /= 65535.0
-    if args.debug:
-        print("Image Type: %s" % img.dtype.name)
+
+    if 'debug' in args.debug:
+        print("-->Image Statistics: Image Type: %s" % img.dtype.name)
+
     statistics['Mean'] = mmean
     statistics['StdDev'] = mstd
     # blur detection measure using Variance of Laplacian (see https://www.pyimagesearch.com/2015/09/07/blur-detection-with-opencv/#)
@@ -152,10 +157,10 @@ def writeImage(filename, img, camera, args, timestring):
     elif extension == 'hdr':
         params = None
 
-    print("Saving image " + filename)
+    print("->Write Image: Saving image " + filename)
     status = cv2.imwrite(filename, img, params=params)
     if (args.metadata is not None) and ('exif' in args.metadata):
-        print("Writing EXIF tags")
+        print("->Write Image: Writing EXIF tags")
         exiftags = {**camctrls, **imgstats}
         # Generate dictionary of EXIF tags from camera control values and image statistics
         exiftags['ExposureTime'] = exiftags.pop('Exposure')
@@ -186,10 +191,12 @@ def writeImage(filename, img, camera, args, timestring):
             exifpars.append("-{}={}".format(tag, value))
         exifpars.append(filename)
         process = subprocess.run(exifpars, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        if args.debug:
-            print('EXIFtool stdout: %s' % process.stdout)
-        if args.debug:
-            print('EXIFtool stderr: %s' % process.stderr)
+
+        if 'debug' in args.debug:
+            print('->Write Image: EXIFtool stdout: %s' % process.stdout)
+            print('->Write Image: EXIFtool stderr: %s' % process.stderr)
+    print("->Write Image: Image saved")
+
     return status
 
 #Define 2D Gaussian Function for fitting through star blob data.
@@ -301,15 +308,17 @@ def postprocess(args, camera):
                 # shows up when taking statistics
                 imgstats = get_image_statistics(img)
             except:
-                print("Error in readin image %s. Skipping to next file" % imgfile)
+                print("->Postprocess: Error in readin image %s. Skipping to next file" % imgfile)
                 continue
             #Focus scale index
             indx[idx] = int(imgfile.split('.')[-3:])
             #Detect blobs as candicates for focusing
             blobs = blob_doh(img, max_sigma=sigma, threshold=thresh)
-            print('%d blobs found' % len(blobs))
-            if args.debug:
+            print('->Postprocess: %d blobs found' % len(blobs))
+
+            if 'debug' in args.debug:
                 print(blobs[0, 0:2])
+
             starblob = img[int(blobs[0, 0]-sigma):int(blobs[0, 0]-sigma)+2*sigma, int(blobs[0, 1]-sigma):int(blobs[0, 1]-sigma)+2*sigma]
             #Fit selected blob with gaussian
             params = fitgaussian(starblob)+[0, blobs[0, 0]-sigma, blobs[0, 1]-sigma, 0, 0]
@@ -369,8 +378,10 @@ def postprocess(args, camera):
         #Get image dimensions and channels from first image
         image = cv2.imread(imgfiles[0])
         args.height, args.width, args.channels = image.shape
-        if args.debug:
-            print("Dimensions of first image: H=%d/W=%d/CH=%d" % (args.height, args.width, args.channels))
+
+        if 'debug' in args.debug:
+            print("->Postprocess: Dimensions of first image: H=%d/W=%d/CH=%d" % (args.height, args.width, args.channels))
+
         starttime = datetime.datetime.strptime(re.findall("\d+\.", imgfiles[0])[-1][:-1], '%Y%m%d%H%M%S')
         prevtime = starttime
         mask = None
@@ -379,7 +390,7 @@ def postprocess(args, camera):
             stats = np.zeros((len(imgfiles), 5))
 
         if dovideo:
-            print("Exporting images to video")
+            print("->Postprocess: Exporting images to video")
             vidfile = args.dirtime_12h_ago_path+'/'+args.video[:-4]+args.dirtime_12h_ago+args.video[-4:]
             vid = cv2.VideoWriter(vidfile, cv2.VideoWriter_fourcc(*'mp4v'), \
                                   args.framerate, (args.width, args.height))
@@ -390,7 +401,7 @@ def postprocess(args, camera):
                 # shows up when taking statistics
                 imgstats = get_image_statistics(image)
             except:
-                print("Error in reading image %s. Skipping to next file" % imgfile)
+                print("->Postprocess: Error in reading image %s. Skipping to next file" % imgfile)
                 continue
             if dovideo:
                 vid.write(image)
@@ -420,16 +431,22 @@ def postprocess(args, camera):
                     keogram = np.zeros((height, len(imgfiles), channels), image.dtype)
                 else:
                     keogram[:, idx] = image[:, width//2]
-                print('%s #%d / %d / %s / %6.4f' % (status, idx+1, len(imgfiles), os.path.basename(imgfile), mean))
+                print('->Postprocess: %s #%d / %d / %s / %6.4f' % (status, idx+1, len(imgfiles), os.path.basename(imgfile), mean))
 
         if dovideo:
             vid.release()
-            if args.serverrepo != 'none':
+            if args.serverrepo != 'none' and ('movie' in args.copypolicy or 'movie' in args.movepolicy):
                 if '@' in args.serverrepo:
                     os.system('scp '+vidfile+' '+args.serverrepo+'/')
                 else:
-                    os.system('cp '+vidfile+' '+args.serverrepo+'/')
-            print("Video Exported")
+                    try:
+                        if 'movie' in args.movepolicy:
+                            shutil.move(vidfile, args.serverrepo+'/')
+                        else:
+                            shutil.copy2(vidfile, args.serverrepo+'/')
+                    except OSError as err:
+                        print('->Postprocess: Target filesystem not writable. Error ', err)
+            print("->Postprocess: Video Exported")
         if dostart:
 
             #Save Statistics
@@ -446,11 +463,11 @@ def postprocess(args, camera):
             mean_mean = np.mean(stats[:, 0])
             median_mean = np.median(stats[:, 0])
 
-            print("Startrails generation: Minimum: %6.4f / maximum: %6.4f / mean: %6.4f / median: %6.4f" % (min_mean, max_mean, mean_mean, median_mean))
+            print("->Postprocess: Startrails generation: Minimum: %6.4f / maximum: %6.4f / mean: %6.4f / median: %6.4f" % (min_mean, max_mean, mean_mean, median_mean))
 
             #If we still don't have an image (no images below threshold), copy the minimum mean image so we see why
             if startrails is None:
-                print('No images below threshold, writing the minimum image only')
+                print('->Postprocess: No images below threshold, writing the minimum image only')
                 startrails = cv2.imread(imgfiles[min_loc[1]], cv2.IMREAD_UNCHANGED)
 
             #Apply mask to remove mangled labels
@@ -458,11 +475,12 @@ def postprocess(args, camera):
             startrails *= mask
             #Label time interval of startrails if args.time is set
             if args.time:
-                print("Writing Caption to star trails")
+                print("->Postprocess: Writing Caption to star trails")
                 caption = ["from " + startrails_tstart.strftime("%d.%b.%Y %X"), \
                            "to   " + startrails_tend.strftime("%d.%b.%Y %X")]
-                if args.debug:
-                    print("Caption is: %s, %s" % (caption[0], caption[1]))
+                if 'debug' in args.debug:
+                    print("->Postprocess: Caption is: %s, %s" % (caption[0], caption[1]))
+
                 if args.text != "":
                     caption = args.text + "\n" + caption
                 lasty = _stamptext(startrails, caption[0], 0, args)
@@ -470,32 +488,180 @@ def postprocess(args, camera):
 
             startfile = args.dirtime_12h_ago_path+'/'+args.startrailsoutput[:-4]+args.dirtime_12h_ago+args.startrailsoutput[-4:]
             status = writeImage(startfile, startrails, camera, args, datetime.datetime.now())
-            if args.serverrepo != 'none':
+            if args.serverrepo != 'none' and ('startrails' in args.copypolicy or 'startrails' in args.movepolicy):
                 if '@' in args.serverrepo:
                     os.system("scp "+startfile+" "+args.serverrepo+"/")
+                    if 'txt' in args.metadata:
+                        os.system("scp "+startfile[:-4]+".txt"+" "+args.serverrepo+"/")
+
                 else:
-                    os.system('cp '+startfile+' '+args.serverrepo+'/')
-            print("Startrail Image", startfile, " written to file-system : ", status)
+                    try:
+                        if 'startrails' in args.movepolicy:
+                            shutil.move(startfile, args.serverrepo+'/')
+                            if 'txt' in args.metadata:
+                                shutil.move(startfile[:-4]+".txt", args.serverrepo+"/")
+                        else:
+                            shutil.copy2(startfile, args.serverrepo+'/')
+                            if 'txt' in args.metadata:
+                                shutil.copy2(startfile[:-4]+".txt", args.serverrepo+"/")
+                    except OSError as err:
+                        print('->Postprocess: Target filesystem not writable. Error ', err)
+            print("->Postprocess: Startrail Image", startfile, " written to file-system : ", status)
         if dokeogr:
             geogrfile = args.dirtime_12h_ago_path+'/'+args.keogramoutput[:-4]+args.dirtime_12h_ago+args.keogramoutput[-4:]
             status = writeImage(geogrfile, keogram, camera, args, datetime.datetime.now())
 #            status = cv2.imwrite(geogrfile, keogram, args.fileoptions)
-            if args.serverrepo != 'none':
+            if args.serverrepo != 'none' and ('keogram' in args.copypolicy or 'keogram' in args.movepolicy):
                 if '@' in args.serverrepo:
                     os.system("scp "+geogrfile+" "+args.serverrepo+"/")
+                    if 'txt' in args.metadata:
+                        os.system("scp "+geogrfile[:-4]+".txt"+" "+args.serverrepo+"/")
                 else:
-                    os.system('cp '+geogrfile+' '+args.serverrepo+'/')
-            print("Image", geogrfile, " written to file-system : ", status)
-        # Copy all image files over to server (only for debugging, images are kept on the camera "nightstokeep" times)
-#        if args.serverrepo != 'none':
-#            if '@' in args.serverrepo:
-#                os.system("scp "+args.dirtime_12h_ago_path+"/"+
-#                          args.filename[:-4]+"*."+args.extension+" "+
-#                          args.serverrepo+"/"+args.dirtime_12h_ago+"/")
-#            else:
-#                os.system("cp "+args.dirtime_12h_ago_path+"/"+
-#                          args.filename[:-4]+"*."+args.extension+" "+
-#                          args.serverrepo+"/"+args.dirtime_12h_ago+"/")
+                    try:
+                        if 'keogram' in args.movepolicy:
+                            shutil.move(geogrfile, args.serverrepo+'/')
+                            if 'txt' in args.metadata:
+                                shutil.move(geogrfile[:-4]+".txt", args.serverrepo+"/")
+                        else:
+                            shutil.copy2(geogrfile, args.serverrepo+'/')
+                            if 'txt' in args.metadata:
+                                shutil.copy2(geogrfile[:-4]+".txt", args.serverrepo+"/")
+                    except OSError as err:
+                        print('->Postprocess: Target filesystem not writable. Error ', err)
+            print("->Postprocess: Image", geogrfile, " written to file-system : ", status)
+        # Copy all image files over to server (images are kept on the camera "nightstokeep" times)
+        if args.serverrepo != 'none' and ('images' in args.copypolicy or 'images' in args.movepolicy):
+            print('Copying/Moving images to server repository.')
+            if '@' in args.serverrepo:
+                os.system("scp "+args.dirtime_12h_ago_path+"/"+
+                          args.filename[:-4]+"*."+args.extension+" "+
+                          args.serverrepo+"/"+args.dirtime_12h_ago+"/")
+                if 'txt' in args.metadata:
+                    os.system("scp "+args.dirtime_12h_ago_path+"/"+
+                              args.filename[:-4]+"*.txt "+
+                              args.serverrepo+"/"+args.dirtime_12h_ago+"/")
+            else:
+                try:
+                    shutil.copytree(args.dirtime_12h_ago_path, os.path.join(args.serverrepo, args.dirtime_12h_ago))
+                except shutil.Error as err:
+                    print('->Postprocess: When copying image directory', args.dirtime_12h_ago,
+                          'to directory', os.path.join(args.serverrepo, args.dirtime_12h_ago),
+                          'an Error', err, 'occured.')
+#                if 'images' in args.movepolicy:
+#                    map(os.remove, imgfiles)
+
+def fetch_yale_bright_star_list(catalog_dir="data/Yale_Bright_Star_Catalog"):
+    """
+    Read the Yale Bright Star Catalogue from disk, and return it as a dictionary of stars.
+    Basis of routine was: https://github.com/dcf21/planisphere/blob/master/bright_stars_process.py
+    :return:
+        Dictionary with hd_number as key
+    """
+
+    # Build a dictionary of stars, indexed by HD number
+    stars = {}
+
+    # Convert three-letter abbreviations of Greek letters into UTF-8
+    greek_alphabet = {'Alp': '\u03b1', 'Bet': '\u03b2', 'Gam': '\u03b3', 'Del': '\u03b4', 'Eps': '\u03b5',
+                      'Zet': '\u03b6', 'Eta': '\u03b7', 'The': '\u03b8', 'Iot': '\u03b9', 'Kap': '\u03ba',
+                      'Lam': '\u03bb', 'Mu': '\u03bc', 'Nu': '\u03bd', 'Xi': '\u03be', 'Omi': '\u03bf',
+                      'Pi': '\u03c0', 'Rho': '\u03c1', 'Sig': '\u03c3', 'Tau': '\u03c4', 'Ups': '\u03c5',
+                      'Phi': '\u03c6', 'Chi': '\u03c7', 'Psi': '\u03c8', 'Ome': '\u03c9'}
+
+    # Superscript numbers which we may place after Greek letters to form the Flamsteed designations of stars
+    star_suffices = {'1': '\u00B9', '2': '\u00B2', '3': '\u00B3'}
+
+    # Look up the common names of bright stars from the notes section of the catalog
+    star_names = []
+    notes_file = os.path.join(sys.path[0], catalog_dir, "notes")
+    for line in open(notes_file, "rt"):
+        if re.match("^\s+\d+\s1N\:\s+([a-zA-Z\s\,\'\"\(\)]+(\;|\.))+", line) is not None:
+            res = re.split(" 1N:\s+|; |\.|,", line.strip())
+            star_names.append([int(res[0]),
+                               re.sub('Called | in Becvar| in most catalogues|\"|Usually called | \(rarely used\)',
+                                      '', res[1]).lower().title()])
+    star_names = dict(star_names)
+    non_star_names = [182, 575, 662, 958, 2227, 2462, 2548, 2944, 2954, 2970, 3080, 3084, 3113, 3185, 3447, 3464, 3659, 3669, 3738, 5573, 5764, 6957, 7955, 8066, 8213, 8371, 8406]
+    for k in non_star_names:
+        star_names.pop(k, None)
+
+    catalog_file = os.path.join(sys.path[0], catalog_dir, "catalog")
+
+    # Loop through the Yale Bright Star Catalog, line by line
+    bs_num = 0
+    for line in open(catalog_file, "rt"):
+        # Ignore blank lines and comment lines
+        if (len(line) < 100) or (line[0] == '#'):
+            continue
+
+        # Counter used too calculated the bright star number -- i.e. the HR number -- of each star
+        bs_num += 1
+        try:
+            # Read the Henry Draper (i.e. HD) number for this star
+            hd = int(line[25:31])
+
+            # Read the right ascension of this star (J2000)
+            ra_hrs = float(line[75:77])
+            ra_min = float(line[77:79])
+            ra_sec = float(line[79:83])
+
+            # Read the declination of this star (J2000)
+            dec_neg = (line[83] == '-')
+            dec_deg = float(line[84:86])
+            dec_min = float(line[86:88])
+            dec_sec = float(line[88:90])
+
+            # Read the V magnitude of this star
+            mag = float(line[102:107])
+        except ValueError:
+            continue
+
+        # Look up the Bayer number of this star, if one exists
+        star_num = -1
+        try:
+            star_num = int(line[4:7])
+        except ValueError:
+            pass
+
+        # Render a unicode string containing the name, Flamsteed designation, and Bayer designation for this star
+        name_bayer = name_bayer_full = name_english = name_flamsteed_full = "-"
+
+        # Look up the Greek letter (Flamsteed designation) of this star
+        greek = line[7:10].strip()
+
+        # Look up the abbreviation of the constellation this star is in
+        const = line[11:14].strip()
+
+        # Some stars have a suffix after the Flamsteed designation, e.g. alpha-1, alpha-2, etc.
+        greek_letter_suffix = line[10]
+        if greek in greek_alphabet:
+            name_bayer = greek_alphabet[greek]
+            if greek_letter_suffix in star_suffices:
+                name_bayer += star_suffices[greek_letter_suffix]
+            name_bayer_full = '{}-{}'.format(name_bayer, const)
+        if star_num > 0:
+            name_flamsteed_full = '{}-{}'.format(star_num, const)
+
+        # See if this is a star with a name
+        if bs_num in star_names:
+            name_english = star_names.get(bs_num, "-")
+
+        # Turn RA and Dec from sexagesimal units into decimal
+        ra = (ra_hrs + ra_min / 60 + ra_sec / 3600) / 24 * 360
+        dec = (dec_deg + dec_min / 60 + dec_sec / 3600)
+        if dec_neg:
+            dec = -dec
+
+        # Build a dictionary is stars, indexed by HD number
+        stars[hd] = [ra, dec, mag, name_bayer, name_bayer_full, name_english, name_flamsteed_full]
+
+    hd_numbers = list(stars.keys())
+    hd_numbers.sort()
+
+    return {
+        'stars': stars,
+        'hd_numbers': hd_numbers
+    }
 
 class saveThread(threading.Thread):
     """
@@ -519,7 +685,7 @@ class dht22Thread(threading.Thread):
     """
     thread for reading DHT22 data and timeout (given by timeout) if no readout within DHT22 read interval (given by read_interval in seconds)
     """
-    def __init__(self, event, camera, read_interval=None, timeout=None):
+    def __init__(self, event, camera, read_interval=None, timeout=None, debug=False):
         threading.Thread.__init__(self)
         if read_interval is None:
             self.read_interval = 5 * 60
@@ -538,24 +704,33 @@ class dht22Thread(threading.Thread):
         self.specific_humidity = 0
         self.pressure = 0
         self.dewpoint = 0
+        self.debug = debug
+
     def run(self):
         while True:
             try:
                 #Read data of DHT22 sensor
                 dht22data = subprocess.run(['/home/rainer/Documents/AllSkyCam/AllSkyCapture/readdht22.sh'], stdout=subprocess.PIPE, timeout=self.timeout)
                 self.dht22hum, self.dht22temp = [float(i) for i in re.split(' \= | \%| \*', dht22data.stdout.decode('ascii'))[1::2][:-1]]
-                isday(True)
-                print("Output of DHT22: Temperature = ", self.dht22temp, "°C / Humidity = ", self.dht22hum, "%")
                 #Write data of DHT22 sensor into Homematic
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22276,22275&new_value="+"{:.1f},{:.1f}".format(self.dht22hum, self.dht22temp))
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22276,22275&new_value="+"{:.1f},{:.1f}".format(self.dht22hum, self.dht22temp))
+                except ConnectionError:
+                    print("->DHT22: Data could not be written into the Homematic system variables.")
                 if r.status_code != requests.codes['ok']:
-                    print("Data could not be written into the Homematic system variables.")
+                    print("->DHT22: Data could not be written into the Homematic system variables.")
                 #Write Camera Sensor Temperature into Homematic
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22277&new_value="+"{:.1f}".format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22277&new_value="+"{:.1f}".format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
+                except ConnectionError:
+                    print("->DHT22: Data could not be written into the Homematic system variables.")
                 if r.status_code != requests.codes['ok']:
-                    print("Data could not be written into the Homematic system variables.")
+                    print("->DHT22: Data could not be written into the Homematic system variables.")
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
+                except ConnectionError:
+                    print("->DHT22: Air pressure data could not be read from the Homatic system variables.")
                 self.pressure = float(re.split('\=| ', r.text)[12][1:-1])
                 position.pressure = self.pressure
                 press = units.Quantity(self.pressure, 'hPa')
@@ -564,11 +739,17 @@ class dht22Thread(threading.Thread):
                 self.mixratio = mcalc.mixing_ratio_from_relative_humidity(float(self.dht22hum)/100, self.temperature, press)
                 self.specific_humidity = mcalc.specific_humidity_from_mixing_ratio(self.mixratio)
                 self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, self.temperature, press).magnitude
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22278&new_value="+"{:.1f}".format(self.dewpoint))
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22278&new_value="+"{:.1f}".format(self.dewpoint))
+                except ConnectionError:
+                    print("->DHT22: Data could not be written into the Homematic system variables.")
                 if r.status_code != requests.codes['ok']:
-                    print("Data could not be written into the Homematic system variables.")
+                    print("->DHT22: Data could not be written into the Homematic system variables.")
+                if self.debug:
+                    isday(True)
+                    print("->Output of DHT22: Temperature = %.2f°C / Humidity = %.1f%% / Dew Point = %.2f°C" % (self.dht22temp, self.dht22hum, self.dewpoint))
             except subprocess.TimeoutExpired:
-                print("Waited", self.timeout, "seconds, and did not get any valid data from DHT22")
+                print("->DHT22: Waited", self.timeout, "seconds, and did not get any valid data from DHT22")
             if self.stopped.wait(self.read_interval):
                 break
 
@@ -576,7 +757,7 @@ class WeatherThread(threading.Thread):
     """
     thread for reading Weather data from Homematic and timeout (given by timeout) if no readout within read interval (given by read_interval in seconds)
     """
-    def __init__(self, event, camera, read_interval=None, timeout=None):
+    def __init__(self, event, camera, read_interval=None, timeout=None, debug=False):
         threading.Thread.__init__(self)
         if read_interval is None:
             self.read_interval = 5 * 60
@@ -595,31 +776,43 @@ class WeatherThread(threading.Thread):
         self.specific_humidity = 0
         self.pressure = 0
         self.dewpoint = 0
+        self.debug = debug
+
     def run(self):
         while True:
             try:
                 #Read data of Homematic sensor
                 #Read Temperature at Roof
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12378")
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12378")
+                except ConnectionError:
+                    print("->Weather: Roof Temperature Data could not be read from the Homematic system.")
                 if r.status_code != requests.codes['ok']:
-                    print("Roof Temperature Data could not be read from the Homematic system.")
+                    print("->Weather: Roof Temperature Data could not be read from the Homematic system.")
                 self.temperature = float(re.split('=|/|\'', r.text)[-4])
                 position.temp = self.temperature
                 temp = units.Quantity(self.temperature, 'degC')
                 #Read Humidity at Roof
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12380")
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12380")
+                except ConnectionError:
+                    print("->Weather: Roof Humidity Data could not be read from the Homematic system.")
                 if r.status_code != requests.codes['ok']:
-                    print("Roof Humidity Data could not be read from the Homematic system.")
+                    print("->Weather: Roof Humidity Data could not be read from the Homematic system.")
                 self.humidity = float(re.split('=|/|\'', r.text)[-4])
                 #Read Light Intensity at Roof
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12382")
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12382")
+                except ConnectionError:
+                    print("->Weather: Roof Light Intensity Data could not be read from the Homematic system.")
                 if r.status_code != requests.codes['ok']:
-                    print("Roof Light Intensity Data could not be read from the Homematic system.")
+                    print("->Weather: Roof Light Intensity Data could not be read from the Homematic system.")
                 self.intensity = float(re.split('=|/|\'', r.text)[-4])
-                isday(True)
-                print("Conditions at Roof: Temperature = ", self.temperature, "°C / Humidity = ", self.humidity, "% / Light Intensity = ", self.intensity)
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
+                except ConnectionError:
+                    print("->Weather: Air pressure data could not be read from the Homatic system variables.")
                 self.pressure = float(re.split('\=| ', r.text)[12][1:-1])
                 position.pressure = self.pressure
                 press = units.Quantity(self.pressure, 'hPa')
@@ -627,11 +820,18 @@ class WeatherThread(threading.Thread):
                 self.mixratio = mcalc.mixing_ratio_from_relative_humidity(float(self.humidity)/100, temp, press)
                 self.specific_humidity = mcalc.specific_humidity_from_mixing_ratio(self.mixratio)
                 self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, temp, press).magnitude
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24771&new_value="+"{:.1f}".format(self.dewpoint))
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24771&new_value="+"{:.1f}".format(self.dewpoint))
+                except ConnectionError:
+                    print("->Weather: External Dew Point Data could not be written into the Homatic system variables.")
                 if r.status_code != requests.codes['ok']:
-                    print("External Dew Point Data could not be written into the Homatic system variables.")
+                    print("->Weather: External Dew Point Data could not be written into the Homatic system variables.")
+                if self.debug:
+                    isday(True)
+                    print("->Weather: Conditions at Roof: Temperature = %.2f°C / Humidity = %.1f%% / Light Intensity = %d / Dew Point = %.2f°C" % (self.temperature, self.humidity, self.intensity, self.dewpoint))
+                    print("->Weather: Air Pressure = ", self.pressure)
             except subprocess.TimeoutExpired:
-                print("Waited", self.timeout, "seconds, and did not get any valid data from Homematic")
+                print("->Weather: Waited", self.timeout, "seconds, and did not get any valid data from Homematic")
             if self.stopped.wait(self.read_interval):
                 break
 
@@ -670,13 +870,13 @@ class IRSensor:
         self.debug = debug
         self.bus = smbus.SMBus(self.getI2CBusNumber())
         if debug:
-            print("I2C Bus Number: %d" % self.getI2CBusNumber())
+            print("->IRSensor: I2C Bus Number: %d" % self.getI2CBusNumber())
 
     def errMsg(self, error):
         """
         returns I2C errors
         """
-        print("Error accessing 0x%02X(%X): Check your I2C address" % (self.address, error))
+        print("->IRSensor: Error accessing 0x%02X(%X): Check your I2C address" % (self.address, error))
         return -1
 
     # Only write16, readU16 and readS16 commands
@@ -692,7 +892,7 @@ class IRSensor:
             if not little_endian:
                 result = ((result << 8) & 0xFF00) + (result >> 8)
             if self.debug:
-                print("I2C: Device 0x%02X returned 0x%04X from reg 0x%02X" % (self.address, result & 0xFFFF, reg))
+                print("->IRSensor: Device 0x%02X returned 0x%04X from reg 0x%02X" % (self.address, result & 0xFFFF, reg))
             return result
         except IOError as err:
             return self.errMsg(err)
@@ -712,7 +912,7 @@ class IRSensor:
         try:
             self.bus.write_word_data(self.address, reg, value)
             if self.debug:
-                print(("I2C: Wrote 0x%02X to register pair 0x%02X,0x%02X" %
+                print(("->IRSensor: Wrote 0x%02X to register pair 0x%02X,0x%02X" %
                        (value, reg, reg+1)))
             return None
         except IOError as err:
@@ -750,7 +950,7 @@ class IRSensorThread(threading.Thread):
     """
     thread for reading MLX90614 IR Sensor
     """
-    def __init__(self, event, camera, read_interval=None, timeout=None):
+    def __init__(self, event, camera, read_interval=None, timeout=None, debug=False):
         threading.Thread.__init__(self)
         if read_interval is None:
             self.read_interval = 5 * 60
@@ -764,21 +964,26 @@ class IRSensorThread(threading.Thread):
         self.camera = camera
         self.Ta = 0
         self.Tobj = 0
-        self.IRsensor = IRSensor(debug=False)
+        self.debug = debug
+        self.IRsensor = IRSensor(debug=self.debug)
     def run(self):
         while True:
             try:
                 #Read data of MLX90614 IR sensor
                 self.Ta = self.IRsensor.Ta()
                 self.Tobj = self.IRsensor.Tobj()
-                isday(True)
-                print("Output of MLX90614: TAmbient = ", self.Ta, "°C / TSky = ", self.Tobj, "°C")
+                if self.debug:
+                    isday(True)
+                    print("->IRSensor: Output: TAmbient = %.2f°C / TSky = %.2f°C" % (self.Ta, self.Tobj))
                 #Write data of MLX90614 IR sensor into Homematic
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24737,24738&new_value="+"{:.1f},{:.1f}".format(self.Ta, self.Tobj))
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24737,24738&new_value="+"{:.1f},{:.1f}".format(self.Ta, self.Tobj))
+                except ConnectionError:
+                    print("->IRSensor: Data could not be written into the Homatic system variables.")
                 if r.status_code != requests.codes['ok']:
-                    print("Data could not be written into the Homatic system variables.")
+                    print("->IRSensor: Data could not be written into the Homatic system variables.")
             except subprocess.TimeoutExpired:
-                print("Waited", self.timeout, "seconds, and did not get any valid data from MLX90614")
+                print("->IRSensor: Waited", self.timeout, "seconds, and did not get any valid data from MLX90614")
             if self.stopped.wait(self.read_interval):
                 break
 
@@ -810,7 +1015,7 @@ def switchpin(pin, state=True):
                 f.write(str(pin))
                 f.close()
     except:
-        print("Error in setting pin %d to state %s. Resuming operation..." % (pin, state))
+        print("-> switchpin: Error in setting pin %d to state %s. Resuming operation..." % (pin, state))
 
 def pinstatus(pin):
     """
@@ -901,16 +1106,22 @@ def heaterControl(tambient, tdewpoint, sensitivity=1.5, hysteresis=1.0):
     if not heateron() and tambient - tdewpoint < sensitivity:
         turnonHeater()
         #Write data of MLX90614 IR sensor into Homematic
-        r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=1")
+        try:
+            r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=1")
+        except ConnectionError:
+            print("-> heaterControl: Data could not be written into the Homatic system variable.")
         if r.status_code != requests.codes['ok']:
-            print("Data could not be written into the Homatic system variable.")
-        print("\n\nDew Heater turned on(Ta=%f,Td=%f)\n\n" % (tambient, tdewpoint))
+            print("-> heaterControl: Data could not be written into the Homatic system variable.")
+        print("\n\n-> heaterControl: Dew Heater turned on(Ta=%f,Td=%f)\n\n" % (tambient, tdewpoint))
     elif heateron() and tambient - tdewpoint > sensitivity + hysteresis:
         turnoffHeater()
-        r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=0")
+        try:
+            r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=0")
+        except ConnectionError:
+            print("-> heaterControl: Data could not be written into the Homatic system variable.")
         if r.status_code != requests.codes['ok']:
-            print("Data could not be written into the Homatic system variable.")
-        print("\n\nDew Heater turned off(Ta=%f,Td=%f)\n\n" % (tambient, tdewpoint))
+            print("-> heaterControl: Data could not be written into the Homatic system variable.")
+        print("\n\n-> heaterControl: Dew Heater turned off(Ta=%f,Td=%f)\n\n" % (tambient, tdewpoint))
 
 class INA219:
     """Class containing the INA219 functionality."""
@@ -1022,8 +1233,8 @@ class INA219:
 
         self.address = address
         self.debug = debug
-        if debug:
-            print("I2C Bus Number: %d" % self._geti2cbusnumber())
+        if self.debug:
+            print("->Power Meter: I2C Bus Number: %d" % self._geti2cbusnumber())
         self.bus = smbus.SMBus(self._geti2cbusnumber())
         self._shunt_ohms = shunt_ohms
         self._max_expected_amps = max_expected_amps
@@ -1038,7 +1249,7 @@ class INA219:
         """
         prints low level error message if I2C address cannot be accessed
         """
-        print("Error accessing 0x%02X(%X): Check your I2C address" % (self.address, error))
+        print("->Power Meter: Error accessing 0x%02X(%X): Check your I2C address" % (self.address, error))
         return -1
 
     # Only writelist, readu16 and reads16 commands
@@ -1054,7 +1265,7 @@ class INA219:
             if not little_endian:
                 result = ((result << 8) & 0xFF00) + (result >> 8)
             if self.debug:
-                print("I2C: Device 0x%02X returned 0x%04X from reg 0x%02X" %
+                print("->Power Meter: Device 0x%02X returned 0x%04X from reg 0x%02X" %
                       (self.address, result & 0xFFFF, reg))
             return result
         except IOError as err:
@@ -1373,9 +1584,9 @@ class DeviceRangeError(Exception):
 
 class CurrentSensorThread(threading.Thread):
     """
-    thread for reading MLX90614 IR Sensor
+    thread for reading INA219 Power Meter
     """
-    def __init__(self, event, camera, read_interval=None, timeout=None):
+    def __init__(self, event, camera, read_interval=None, timeout=None, debug=False):
         threading.Thread.__init__(self)
         if read_interval is None:
             self.read_interval = 5 * 60
@@ -1389,12 +1600,13 @@ class CurrentSensorThread(threading.Thread):
         self.camera = camera
         self._shunt_ohms = 0.1
         self._max_expected_amps = 2.0
-        self._currentsensor = INA219(self._shunt_ohms, max_expected_amps=self._max_expected_amps, debug=False)
+        self._currentsensor = INA219(self._shunt_ohms, max_expected_amps=self._max_expected_amps, debug=debug)
         self._currentsensor.configure(self._currentsensor.RANGE_16V)
         self.voltage = None
         self.current = None
         self.power = None
         self.shunt_voltage = None
+        self.debug = debug
 
     def run(self):
         while True:
@@ -1407,20 +1619,24 @@ class CurrentSensorThread(threading.Thread):
                     self.shunt_voltage = self._currentsensor.shunt_voltage()
                 except DeviceRangeError as err:
                     # Current out of device range with specified shunt resistor
-                    print(err)
+                    print("->Power Meter: ", err)
                     break
 
-                isday(True)
-                print("Output of INA219: Bus Voltage  : %.3f V" % self.voltage)
-                print("                  Bus Current  : %.3f mA" % self.current)
-                print("                  Bus Power    : %.3f mW" % self.power)
-                print("                  Shunt Voltage: %.3f mV" % self.shunt_voltage)
+                if self.debug:
+                    isday(True)
+                    print("->Power Meter: Output of INA219: Bus Voltage  : %.3f V" % self.voltage)
+                    print("->Power Meter:                   Bus Current  : %.3f mA" % self.current)
+                    print("->Power Meter:                   Bus Power    : %.3f mW" % self.power)
+                    print("->Power Meter:                   Shunt Voltage: %.3f mV" % self.shunt_voltage)
                 #Write data of INA219 sensor into Homematic
-                r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24742,24743,24744,24745&new_value="+"{:.3f},{:.3f},{:.3f},{:.3f}".format(self.voltage, self.current, self.power, self.shunt_voltage))
+                try:
+                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24742,24743,24744,24745&new_value="+"{:.3f},{:.3f},{:.3f},{:.3f}".format(self.voltage, self.current, self.power, self.shunt_voltage))
+                except ConnectionError:
+                    print("->Power Meter: Data could not be written into the Homatic system variables.")
                 if r.status_code != requests.codes['ok']:
-                    print("Data could not be written into the Homatic system variables.")
+                    print("->Power Meter: Data could not be written into the Homatic system variables.")
             except subprocess.TimeoutExpired:
-                print("Waited", self.timeout, "seconds, and did not get any valid data from MLX90614")
+                print("->Power Meter: Waited", self.timeout, "seconds, and did not get any valid data from MLX90614")
             if self.stopped.wait(self.read_interval):
                 break
 
@@ -1445,7 +1661,8 @@ def switchblock(blockstate):
     """
     global blockimaging # pylint: disable=W0603
     blockimaging = blockstate
-    print('Block-State switched to ', blockimaging)
+    if 'debug' in args.debug:
+        print('Block-State switched to ', blockimaging)
 
 def savecamerasettings(camera):
     """
@@ -1485,7 +1702,7 @@ def getexposureoptimum(args, camera):
 
     # Use autoexposure for first analemma image
 
-    print("Determine exposure through autoexposure on reduced FOV")
+    print("-> Get Exposure Optimum: Determine exposure through autoexposure on reduced FOV")
 
     camera.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, 90)
 
@@ -1507,8 +1724,8 @@ def getexposureoptimum(args, camera):
     camera.set_roi(start_x=None, start_y=None, width=width, height=height)
     startx, starty, width, height = camera.get_roi()
 
-    if args.debug:
-        print('ROI for autoexposure: Width %d, Height %d, xstart %d, ystart %d\n' %
+    if 'debug' in args.debug:
+        print('-> Get Exposure Optimum: ROI for autoexposure: Width %d, Height %d, xstart %d, ystart %d\n' %
               (width, height, startx, starty))
 
     # start video capture
@@ -1525,7 +1742,7 @@ def getexposureoptimum(args, camera):
 
     # Do autoexposure loop reading exposure values from camera
     # until the values are not changing anymore for 5 consecutive times
-    print('Waiting for auto-exposure to compute correct settings ...')
+    print('-> Get Exposure Optimum: Waiting for auto-exposure to compute correct settings ...')
     sleep_interval = 0.100
     df_last = None
     autoex_last = None
@@ -1535,8 +1752,8 @@ def getexposureoptimum(args, camera):
         df = camera.get_dropped_frames()
         autoex = camera.get_control_values()['Exposure']
         if df != df_last:
-            if args.debug:
-                print('   Exposure: {autoex:f} \u03BCs Dropped frames: {df:d}'
+            if 'debug' in args.debug:
+                print('   -> Get Exposure Optimum: Exposure: {autoex:f} \u03BCs Dropped frames: {df:d}'
                       .format(autoex=autoex, df=df))
             if autoex == autoex_last:
                 matches += 1
@@ -1547,7 +1764,7 @@ def getexposureoptimum(args, camera):
             df_last = df
             autoex_last = autoex
 
-    print("Final autoexposure: %d \u03BCs" % autoex)
+    print("-> Get Exposure Optimum: Final autoexposure: %d \u03BCs" % autoex)
 
     camera.stop_video_capture()
     camera.stop_exposure()
@@ -1566,7 +1783,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     global meantranstimemoon # pylint: disable=W0603
     print(prefix+"Analemma Capture Time triggered")
     # Generate analemma subdirectory if this directory is not present and if the analemma parameter is specified
-    analemmabase = args.dirname + "/analemma"
+    analemmabase = os.path.join(args.dirname, "analemma")
     if not os.path.isdir(analemmabase):
         try:
             os.mkdir(analemmabase)
@@ -1632,7 +1849,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
 
         # postprocess image
         # If aperture should be masked, apply circular masking
-        if args.maskaperture != False:
+        if args.maskaperture != False: #pylint: disable=C0121
             #Do mask operation
             img *= mask
 
@@ -1647,7 +1864,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     for i, img in enumerate(imgs):
         print('Save %d frame of %d' % (i + 1, len(imgs)))
         # Define file base string (for image and image info file)
-        filebase = analemmabase+'/'+prefix.lower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i])
+        filebase = os.path.join(analemmabase, prefix.lower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i]))
         writeImage(filebase+'.'+args.extension, img, camera, args, datetime.datetime.now())
 
     switchblock(False)
@@ -1657,7 +1874,7 @@ def generateHDR(args, camera, imgs, times, timestring, prefix):
     """
     Generates HDR images from LDR exposure sequence given in imgs with exposure times times
     """
-    analemmabase = args.dirname + "/analemma"
+    analemmabase = os.path.join(args.dirname, "analemma")
     print('Postprocessing HDR frames into HDR image')
     times = np.asarray(times, dtype=np.float32)
 
@@ -1734,8 +1951,8 @@ def getaperture(args, camera, configfile, overexposure=10, threshold=128, minfea
                                   '2BGR'+debayeralgext), img, 0)
     else:
         img = np.copy(imgbay)
-    if args.debug:
-        cv2.imwrite(args.dirname+'/aperture_orig.png', img)
+    if 'info' in args.debug:
+        cv2.imwrite(os.path.join(args.dirname, 'aperture_orig.png'), img)
     #convert into 8bit grayscale image
     im_th = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if nparraytype == 'uint16':
@@ -1745,8 +1962,8 @@ def getaperture(args, camera, configfile, overexposure=10, threshold=128, minfea
     #remove small features outside the aperture by opening operation
     im_th = cv2.morphologyEx(im_th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (minfeaturesize, minfeaturesize)))
     im = im_th.copy()
-    if args.debug:
-        cv2.imwrite(args.dirname+'/aperture_th.png', im_th)
+    if 'info' in args.debug:
+        cv2.imwrite(os.path.join(args.dirname, 'aperture_th.png'), im_th)
 
     #flood fill outer area
     h, w = im.shape[:2]
@@ -1790,10 +2007,10 @@ def getaperture(args, camera, configfile, overexposure=10, threshold=128, minfea
                    width=origroi[2], height=origroi[3])
 
     # Save aperture for debugging reasons
-    if args.debug:
-        cv2.imwrite(args.dirname+'/aperture.png', image)
+    if 'info' in args.debug:
+        cv2.imwrite(os.path.join(args.dirname, 'aperture.png'), image)
     # Save parameters into configfile
-    filename = args.dirname+'/'+configfile
+    filename = os.path.join(args.dirname, configfile)
     with open(filename, 'w') as f:
         f.write('%.2f, %.2f\n' % (ellipse[0][0], ellipse[0][1]))
         f.write('%.2f, %.2f\n' % (ellipse[1][0], ellipse[1][1]))
@@ -2193,13 +2410,47 @@ parser.add_argument('--debayeralg',
                                 edge-aware interpolation (RAW8/RAW16).''')
 # Daytime capture setting
 parser.add_argument('--debug',
-                    action='store_true',
-                    help='Additional debugging information.')
+                    nargs='?',
+                    const='all',
+                    default=False,
+                    help='Additional debugging information. \
+                        all......returns all debugging information \
+                        memory...returns only information about memory consumption within imaging loop \
+                        info.....returns general information \
+                        debug....returns debugging information \
+                        timing...returns info about timing especially within main exposure loop \
+                        housingsensor...communication info of the DHT22 humidity sensor in the camera housing \
+                        weathersensors..communication info of the homematic weathersensors on the roof \
+                        irsensor........communication info on the IR sensor measuring dome temperature \
+                        powermeter......communication info on the INA219 powermeter in the supply line \
+                        (default: False, if specified without optional parameters, then "all" is assumed')
 # Do only postprocessing (video, startrails and keogram) and no image capture
 parser.add_argument('--postprocessonly',
                     action='store_true',
                     help='Do only postprocessing (video, startrails and keogram) but no image capture. \
                         You have to be in the image directory of the respective day to work.')
+parser.add_argument('--copypolicy',
+                    nargs='?',
+                    const=None,
+                    default='images',
+                    help='''Policy which elements should be copied to serverrepository \
+                        serverrepo. The optional parameter is a list of elements which \
+                        the script should copy over. Possible elements of the list are \
+                        "images","movie","keogram" and "startrails". If None is specified, \
+                        or no optional parameter is given no element is copied. \
+                        (Default images)''')
+parser.add_argument('--movepolicy',
+                    nargs='?',
+                    const=None,
+                    default='movie,keogram,startrails',
+                    help='''Policy which elements should be moved to serverrepository \
+                        serverrepo. This means that they are deleted on the camera. \
+                        Mainly used for space saving on the camera storage drive.
+                        The optional parameter is a list of elements which \
+                        the script should move over. Possible elements of the list are \
+                        "images","movie","keogram" and "startrails". If None is specified, \
+                        or no optional parameter is given no element is moved.\
+                        (Default movie,keogram,startrails)''')
 parser.add_argument('--serverrepo',
                     default='/mnt/MultimediaAllSkyCam',
                     help='''Position and username of repository to store Imagery and Videos. \
@@ -2209,7 +2460,7 @@ parser.add_argument('--serverrepo',
                     (Default /mnt/MultimediaAllSkyCam)''')
 # Autodelete when more than specified nights
 parser.add_argument('--nightstokeep',
-                    default=9,
+                    default=8,
                     type=int,
                     help='Number of nights to keep before start deleting. Set to negative to disable. (Default 10)')
 # Run focus scale exposure
@@ -2285,12 +2536,13 @@ parser.add_argument('--getaperture',
                         be in the range of 1700x1700 pixels, otherwise a wrong contour has been extracted \
                         (if specified without parameter "config.txt,10,128,20" is taken)')
 
+print("=======================================================")
 print("Script allskycapture.py started.")
 print("Parsing command line arguments")
 
 args = parser.parse_args()
 
-args.dirname = os.getcwd()
+args.dirname = sys.path[0]
 args.extension = args.filename.lower().split('.')[-1]
 
 # Check validity of parameters
@@ -2350,9 +2602,8 @@ else:
     args.ftfont = None
     print('Builtin Hershey Font # %d specified' % args.fontname)
     args.fontname = int(args.fontname)
-print('Mask aperture parameter is:',args.maskaperture)
 if args.maskaperture not in ['LTWH', False]:
-    f = open(os.getcwd()+'/'+args.maskaperture, 'r')
+    f = open(os.path.join(sys.path[0], args.maskaperture), 'r')
     lines = f.readlines()
     line = lines[0].strip().split(', ')
     line = lines[1].strip().split(', ')
@@ -2365,6 +2616,28 @@ elif args.maskaperture == 'LTWH':
     args.elltheta = 0
 else:
     args.amask = args.bmask = 0
+    args.elltheta = 0
+validpolicies = ["images", "keogram", "startrails", "movie"]
+if args.copypolicy is not None:
+    args.copypolicy = args.copypolicy.lower().split(",")
+    for policy in args.copypolicy:
+        if policy not in validpolicies:
+            raise ValueError("copypolicy must be one of %r." % validpolicies)
+print("Copy policy is:", args.copypolicy)
+if args.movepolicy is not None:
+    args.movepolicy = args.movepolicy.lower().split(",")
+    for policy in args.movepolicy:
+        if policy not in validpolicies:
+            raise ValueError("movepolicy must be one of %r." % validpolicies)
+print("Move policy is:", args.movepolicy)
+
+if args.debug is False:
+    args.debug = []
+else:
+    args.debug = args.debug.lower().split(',')
+    if 'all' in args.debug:
+        args.debug = ['memory', 'timing', 'info', 'debug', 'housingsensor', 'weathersensors', 'irsensor', 'powermeter']
+    print("Debugging options: ", args.debug)
 
 print("Command line arguments parsed")
 
@@ -2519,11 +2792,12 @@ if args.type == 3: #Y8: One byte (Y) per Bayer pattern
 
 # Check if image directory exists otherwise create it
 
-if not os.path.isdir(args.dirname + "/images"):
+catdir = os.path.join(args.dirname, "images")
+if not os.path.isdir(catdir):
     try:
-        os.mkdir(args.dirname + "/images")
+        os.mkdir(catdir)
     except OSError:
-        print("Creation of the images directory %s failed" % args.dirname + "/images")
+        print("Creation of the images directory %s failed" % catdir)
 
 camera.set_control_value(asi.ASI_EXPOSURE, args.exposure, auto=args.autoexposure)
 camera.set_control_value(asi.ASI_AUTO_MAX_EXP, args.maxexposure)
@@ -2545,7 +2819,7 @@ imgarray = bytearray(args.width*args.height*pixelstorage)
 img = np.zeros((args.height, args.width, 3), nparraytype)
 args.dodebayer = (args.type == asi.ASI_IMG_RAW8 or args.type == asi.ASI_IMG_RAW16) and (args.debayeralg != 'none' or args.getaperture != '')
 
-if args.maskaperture != False:
+if args.maskaperture != False: #pylint: disable=C0121
     print("Masking aperture")
     mask = getmask(args, nparraytype)
 
@@ -2588,28 +2862,28 @@ if args.getaperture != '':
 #Start Temperature and Humidity-Monitoring with DHT22 sensor. Read out every 5min (300sec) and timeout after 10sec
 
 dht22stopFlag = threading.Event()
-dht22thread = dht22Thread(dht22stopFlag, camera, 300, 10)
+dht22thread = dht22Thread(dht22stopFlag, camera, read_interval=300, timeout=10, debug='housingsensor' in args.debug)
 dht22thread.start()
 threads.append(dht22thread)
 
 #Start Temperature and Humidity-Monitoring with Homematic sensor data from Roof sensor. Read out every 5min (300sec) and timeout after 10sec
 
 weatherstopFlag = threading.Event()
-weatherthread = WeatherThread(weatherstopFlag, camera, 300, 10)
+weatherthread = WeatherThread(weatherstopFlag, camera, read_interval=300, timeout=10, debug='weathersensors' in args.debug)
 weatherthread.start()
 threads.append(weatherthread)
 
 #Start IR Temperature Monitoring with MLX90614 sensor. Read out every 5min (300sec) and timeout after 10sec
 
 IRSensorstopFlag = threading.Event()
-IRSensorthread = IRSensorThread(IRSensorstopFlag, camera, 300, 10)
+IRSensorthread = IRSensorThread(IRSensorstopFlag, camera, read_interval=300, timeout=10, debug='irsensor' in args.debug)
 IRSensorthread.start()
 threads.append(IRSensorthread)
 
 #Initialize INA219 Current Sensor with the default parameters
 
 CurrentSensorstopFlag = threading.Event()
-CurrentSensorthread = CurrentSensorThread(CurrentSensorstopFlag, camera, 300, 10)
+CurrentSensorthread = CurrentSensorThread(CurrentSensorstopFlag, camera, 300, 10, debug='powermeter' in args.debug)
 CurrentSensorthread.start()
 threads.append(CurrentSensorthread)
 
@@ -2670,20 +2944,30 @@ if args.analemma != '' or args.moonanalemma != '':
                           hours=triggerh, minutes=triggerm, seconds=triggers,
                           id='moonanalemmaexposure')
 
+reftime = datetime.datetime.now()
+
 while bMain:
 
     try:
-        lastisday = isday(args.debug)
+        lastisday = isday(False)
         if lastisday and not args.daytime:
             # At daytime with --daytime not specified, skip day time capture
-            if args.debug:
-                print("It's daytime... we're not saving images")
+            if 'debug' in args.debug:
+                timed = 100
+            elif 'info' in args.debug:
+                timed = (datetime.datetime.now()-reftime).total_seconds()
+            if timed > 5*60:
+                print("It's daytime... we're not capturing images")
+                lastisday = isday(True)
+                reftime = datetime.datetime.now()
+            else:
+                lastisday = isday(False)
             time.sleep(args.delayDaytime/1000)
         elif blockimaging:
             # Switched on during taking of analemmas (sun and moon)
             # Then the routine just waits for the time delayDaytime in ms at day
             # and for delay in ms at night
-            if args.debug:
+            if 'info' in args.debug:
                 print("Taking analemma... timelapse image capture interrupted")
             if lastisday:
                 time.sleep(args.delayDaytime/1000)
@@ -2695,7 +2979,7 @@ while bMain:
             # where twilight can occur after midnight
             args.time_12h_ago = datetime.datetime.now()-datetime.timedelta(hours=12)
             args.dirtime_12h_ago = args.time_12h_ago.strftime("%Y%m%d")
-            args.dirtime_12h_ago_path = args.dirname + "/images/" + args.dirtime_12h_ago
+            args.dirtime_12h_ago_path = os.path.join(args.dirname, "images", args.dirtime_12h_ago)
             if not os.path.isdir(args.dirtime_12h_ago_path):
                 try:
                     os.mkdir(args.dirtime_12h_ago_path)
@@ -2716,11 +3000,11 @@ while bMain:
             nightlist = sorted(glob.glob(args.dirname + "/images/" + ('[0-9]' * 8)))
             if args.nightstokeep > 0 and len(nightlist) > args.nightstokeep:
                 for dirpath in nightlist[:-args.nightstokeep]:
-                    if args.debug:
+                    if 'info' in args.debug:
                         print('Removing Directory ' + dirpath)
-                    rmtree(dirpath)
+                    shutil.rmtree(dirpath)
             else:
-                if args.debug:
+                if 'info' in args.debug:
                     print('Not more than', args.nightstokeep, 'directories present. No directories removed.')
 
             if args.autoexposure and not lastisday: # autoexposure at night
@@ -2762,21 +3046,25 @@ while bMain:
                 # read image as bytearray from camera
                 print("Starting Exposure (looptime: 0 secs)")
                 reftime = datetime.datetime.now()
-                if args.debug:
-                    print("-----------------------------------------")
+                if 'timing' in args.debug or 'memory' in args.debug:
+                    print("--------------------Loop Start-------------------------")
                     print("Before frame readout:")
-                    print("==>looptime: 0 secs")
-                    print("==>Memory  : %s %%" % psutil.virtual_memory()[2])
+                    if 'timing' in args.debug:
+                        print("==>looptime: 0 secs")
+                    if 'memory' in args.debug:
+                        print("==>Memory  : %s %%" % psutil.virtual_memory()[2])
 
                 try:
                     camera.capture(buffer_=imgarray, filename=None)
                 except:
                     print("Exposure timeout, increasing exposure time\n")
 
-                if args.debug:
+                if 'timing' in args.debug or 'memory' in args.debug:
                     print("After frame readout:")
-                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                    if 'timing' in args.debug:
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    if 'memory' in args.debug:
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 print("Stopping Exposure")
                 # Get current time
@@ -2786,10 +3074,12 @@ while bMain:
                 # convert bytearray to numpy array
                 nparray = np.frombuffer(imgarray, nparraytype)
 
-                if args.debug:
+                if 'timing' in args.debug or 'memory' in args.debug:
                     print("After nparray assignment:")
-                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                    if 'timing' in args.debug:
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    if 'memory' in args.debug:
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 # Debayer image in the case of RAW8 or RAW16 images
                 if args.dodebayer:
@@ -2802,15 +3092,16 @@ while bMain:
                     # reshape numpy array back to image matrix depending on image type
                     img = nparray.reshape((args.height, args.width, args.channels))
 
-                    if args.debug:
+                if 'timing' in args.debug or 'memory' in args.debug:
+                    if args.dodebayer:
                         print("After array reshaping:")
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                    else:
+                        print("After array reshaping and debayering:")
 
-                if args.debug:
-                    print("After debayering:")
-                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                    if 'timing' in args.debug:
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    if 'memory' in args.debug:
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 # read current camera parameters
                 autoExp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
@@ -2829,9 +3120,10 @@ while bMain:
                     histmu[2] = 0
                     for k, p in enumerate(hist):
                         histmu[2] += (k-128)**3*p
-                    if args.debug:
+
+                    if 'debug' in args.debug:
                         print("Auto Gain score: %.2f" % histmu[2])
-                    print("Auto Gain score: %.2f" % histmu[2])
+
                     #Implement PI control (see Rossi2012)
                     autoGainstep = -int(getPIDcontrolvalue(args.delayDaytime if lastisday else args.delay, histmu, kc=1/200000))
                     print("Auto Gain step: %d" % autoGainstep)
@@ -2843,19 +3135,24 @@ while bMain:
 
                 # postprocess image
                 # If aperture should be masked, apply circular masking
-                if args.maskaperture != False:
+                if args.maskaperture != False: #pylint: disable=C0121
                     #Do mask operation
-                    if args.debug:
+
+                    if 'timing' in args.debug or 'memory' in args.debug:
                         print("Before masking:")
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                     img *= mask
 
-                    if args.debug:
+                    if 'timing' in args.debug or 'memory' in args.debug:
                         print("After masking:")
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 # If time parameter is specified, print timestring
                 #(in brackets if text parameter is given as well)
@@ -2866,10 +3163,14 @@ while bMain:
                     caption = timestring.strftime("%d.%b.%Y %X")
                 print('Caption: %s' % caption)
                 if args.takedarkframe == '':
-                    if args.debug:
+
+                    if 'timing' in args.debug or 'memory' in args.debug:
                         print('Writing image caption:')
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
                     lasty = _stamptext(img, caption, 0, args)
                     if args.details:
                         #Output into to left corner of the image underneath the Date-Time Caption
@@ -2919,20 +3220,27 @@ while bMain:
                         else:
                             caption = 'Heater is OFF'
                         lasty = _stamptext(img, caption, lasty, dargs, left=False, top=True)
-                        if args.debug:
-                            print("Image Caption written:")
-                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
+                        if 'info' in args.debug:
+                            if 'timing' in args.debug or 'memory' in args.debug:
+                                print("Image Caption written:")
+                                if 'timing' in args.debug:
+                                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                                if 'memory' in args.debug:
+                                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 # write image
-                if args.debug:
+                if 'timing' in args.debug or 'memory' in args.debug:
                     print("Before image writing thread start:")
-                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                    if 'timing' in args.debug:
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    if 'memory' in args.debug:
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
                 if focuscounter == -1:
                     thread = saveThread(filebase+'.'+args.extension, img, camera, args, timestring)
                 else:
-                    thread = saveThread(args.dirtime_12h_ago_path+'/'+args.filename[:-4]+'_focus_'+'{:02d}'.format(str(focuscounter))+'.'+args.extension, img, camera, args, timestring)
+                    thread = saveThread(args.dirtime_12h_ago_path+'/'+args.filename[:-4]+'_focus_'+'{:02d}'.format(focuscounter)+'.'+args.extension, img, camera, args, timestring)
                 thread.start()
                 threads.append(thread)
 
@@ -2954,10 +3262,12 @@ while bMain:
                         print("Moving focus motor back to original position by %d (%d exposures done)." % (+focusstepwidth*focusframes, focusframes))
                         myStepper.step(+focusstepwidth*focusframes, NanoHatMotor.BACKWARD, NanoHatMotor.INTERLEAVE)
 
-                if args.debug:
+                if 'timing' in args.debug or 'memory' in args.debug:
                     print("Before delay timestep:")
-                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    print("==>Current memory utilization is %s %%" % psutil.virtual_memory()[2])
+                    if 'timing' in args.debug:
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    if 'memory' in args.debug:
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
                 if args.autogain:
                     print("Auto Gain value: %d\n" % autoGain)
@@ -2979,11 +3289,14 @@ while bMain:
                 if waittime > 0:
                     print("Sleeping %.2f s\n" % waittime)
                     time.sleep(waittime)
-                if args.debug:
+
+                if 'timing' in args.debug or 'memory' in args.debug:
                     print("At end of loop:")
-                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-                    print("-----------------------------------------")
+                    if 'timing' in args.debug:
+                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                    if 'memory' in args.debug:
+                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                    print("---------------------Loop End--------------------------")
 
                 if not(lastisday) and isday(False):
                     # Switch off heater
