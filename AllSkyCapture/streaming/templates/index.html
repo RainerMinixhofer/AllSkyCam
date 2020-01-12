@@ -1,73 +1,75 @@
 <html>
   <head>
     <title>AllSkyCam Live Video</title>
+	<link rel="stylesheet" href="https://unpkg.com/purecss@1.0.1/build/pure-min.css" 
+		integrity="sha384-oAOxQR6DkCoMliIh8yFnu25d7Eq/PHS21PClpwjOTeU2jRSq11vu66rf90/cZr47" 
+		crossorigin="anonymous">
+	<link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+	<script src="{{ url_for('static', filename='js/index.js') }}"></script>
   </head>
   <body>
 	<header>
-		<h1>AllSkyCam Live Video</h1>
-		<form>
-			<label for="exposure">Exposure</label>
-			<input id="exposure" type="number" max="2000000000" min="32" value="100">
-			<input type="radio" id="exposureunit_s" name="exposureunit" value="s"> s
-			<input type="radio" id="exposureunit_ms" name="exposureunit" value="ms" checked> ms
-			<input type="radio" id="exposureunit_us" name="exposureunit" value="&mu;s"> &mu;s
-			<label for="gain">Gain</label>
-			<input id="gain" type="number" max="510" min="0" value="0"><br>
-			<label for="autoexposure">AutoExposure</label>
-			<input id="autoexposure" type="checkbox" value="Auto">
-			<label for="automaxexposure">AutoMaxExposure</label>
-			<input id="automaxexposure" type="number" max="60000" min="1" value="100"> ms<br>
-			<label for="autogain">AutoGain</label>
-			<input id="autogain" type="checkbox" value="Auto">
-			<label for="automaxgain">AutoMaxGain</label>
-			<input id="automaxgain" type="number" max="510" min="0" value="255"><br>
-			<label for="flip">Flip</label>
-			<input id="flip" type="number" max="3" min="0" value="0">
+		<div>
+			<h1>AllSkyCam Live Video</h1>
+			<img src="{{ url_for('video_feed') }}">
+		</div>
+		<form class="pure-form">
+			<ul>
+				<li>
+					<label for="exposure">Exposure</label>
+				</li>
+				<li>
+				<input id="exposure" type="number" max="2000000000" min="32" value="100">
+				</li>
+				<li>
+				<input type="radio" id="exposureunit_s" name="exposureunit" value="s"> s
+				</li>
+				<li>
+				<input type="radio" id="exposureunit_ms" name="exposureunit" value="ms"> ms
+				</li>
+				<li>
+				<input type="radio" id="exposureunit_us" name="exposureunit" value="&mu;s" checked> &mu;s
+				</li>
+				<li>
+				<label for="gain">Gain</label>
+				</li>
+				<li>
+				<input id="gain" type="number" max="510" min="0" value="0"><br>
+				</li>
+				<li>
+				<label for="autoexposure">AutoExposure</label>
+				</li>
+				<li class="tg-list-item">
+					<input id="autoexposure" type="checkbox" value="Auto" class="tgl tgl-ios">
+					<label class="tgl-btn" for="autoexposure"></label>
+				</li>
+				<li>
+				<label for="automaxexposure">AutoMaxExposure</label>
+				</li>
+				<li>
+				<input id="automaxexposure" type="number" max="60000" min="1" value="100"> ms<br>
+				</li>
+				<li>
+				<label for="autogain">AutoGain</label>
+				</li>
+				<li class="tg-list-item">
+					<input id="autogain" type="checkbox" value="Auto" class="tgl tgl-ios">
+					<label class="tgl-btn" for="autogain"></label>
+				</li>
+				<li>
+				<label for="automaxgain">AutoMaxGain</label>
+				</li>
+				<li>
+				<input id="automaxgain" type="number" max="510" min="0" value="255"><br>
+				</li>
+				<li>
+				<label for="flip">Flip</label>
+				</li>
+				<li>
+				<input id="flip" type="number" max="3" min="0" value="0">
+				</li>
+			<ul>
 		</form>
 	</header>
-	<img src="{{ url_for('video_feed') }}">
   </body>
-  <style>
-  header {
-	display: flex;
-	flex-direction: row;
-	align-items: center;
-	justify-content: space-around;
-  }
-  </style>
-  <script>
-  window.addEventListener("load", function() {
-	var allInputs = document.querySelectorAll("input");
-	allInputs.forEach((element) => {
-		element.addEventListener("input", (event) => {
-			data = {};
-			allInputs.forEach((element) => {
-				data[element.id] = parseInt(element.value) || element.checked;
-			});
-			fetch("/update", {
-				method: "POST",
-				headers: {
-					'Content-Type': 'application/json'
-				},
-				body: JSON.stringify(data)
-			});
-		});
-	});
-	
-	var toggles = [
-		["#autoexposure", "#automaxexposure"],
-		["#autogain", "#automaxgain"]
-	];
-	
-	toggles.forEach((toggle) => {
-		var element = document.querySelector(toggle[0]);
-		var other = document.querySelector(toggle[1]);
-		other.disabled = element.checked;
-		
-		element.addEventListener("click", (event) => {
-			other.disabled = element.checked;
-		});
-	});
-  });
-  </script>
 </html>

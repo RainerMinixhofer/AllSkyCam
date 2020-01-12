@@ -71,7 +71,7 @@ camera.set_control_value(asi.ASI_HIGH_SPEED_MODE, 0)
 # Disable dark frame subtracting
 camera.disable_dark_subtract()
 # Set ROI, binning and image type (0:RAW8/1:RGB24/2:RAW16/3:Y8)
-imgtype = 2
+imgtype = 0
 debayeralg = 'bl' #bilinear debayer algorithm
 camera.set_roi(0, 0, maxwidth, maxheight, 1, imgtype)
 camera.set_control_value(asi.ASI_EXPOSURE, 100000, auto=False) # in us
@@ -229,6 +229,7 @@ def thread_webAPP():
             expmult = 1000
         else:
             expmult = 1
+        print("Setting exposure to %d us" % data['exposure']*expmult)
         camera.set_control_value(asi.ASI_EXPOSURE, data['exposure']*expmult,
                                  auto=data['autoexposure']) # in us
         camera.set_control_value(asi.ASI_AUTO_MAX_EXP, data['automaxexposure']) # in ms

@@ -159,7 +159,7 @@ def writeImage(filename, img, camera, args, timestring):
 
     print("->Write Image: Saving image " + filename)
     status = cv2.imwrite(filename, img, params=params)
-    if (args.metadata is not None) and ('exif' in args.metadata):
+    if (args.metadata is not None) and ('exif' in args.metadata) and (params is not None):
         print("->Write Image: Writing EXIF tags")
         exiftags = {**camctrls, **imgstats}
         # Generate dictionary of EXIF tags from camera control values and image statistics
@@ -1663,6 +1663,7 @@ def switchblock(blockstate):
     blockimaging = blockstate
     if 'debug' in args.debug:
         print('Block-State switched to ', blockimaging)
+    print('Block-State switched to', blockimaging)
 
 def savecamerasettings(camera):
     """
@@ -1792,6 +1793,10 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     # Get current time
     timestring = datetime.datetime.now()
 
+
+    origexp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
+    origgain = camera.get_control_value(asi.ASI_GAIN)[0]
+
     autoex = getexposureoptimum(args, camera)
 
     print("Autoexposure setting: %d \u03BCs" % autoex)
@@ -1866,6 +1871,10 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
         # Define file base string (for image and image info file)
         filebase = os.path.join(analemmabase, prefix.lower()+'analemma'+timestring.strftime("%Y%m%d%H%M%S_")+str(times[i]))
         writeImage(filebase+'.'+args.extension, img, camera, args, datetime.datetime.now())
+
+
+    camera.set_control_value(asi.ASI_EXPOSURE, origexp, auto=args.autoexposure or lastisday)
+    camera.set_control_value(asi.ASI_GAIN, origgain, auto=args.autogain and not lastisday)
 
     switchblock(False)
     generateHDR(args, camera, imgs, times, timestring, prefix)
@@ -2476,7 +2485,7 @@ parser.add_argument('--focusscale',
 
 # Do sun analemma exposures
 parser.add_argument('--analemma',
-                    default='',
+                    default=None,
                     const='meanmidday',
                     nargs='?',
                     type=str,
@@ -2490,7 +2499,7 @@ parser.add_argument('--analemma',
 
 # Do moon analemma exposures
 parser.add_argument('--moonanalemma',
-                    default='',
+                    default=None,
                     const='meanmeridian',
                     nargs='?',
                     type=str,
@@ -2887,11 +2896,11 @@ CurrentSensorthread = CurrentSensorThread(CurrentSensorstopFlag, camera, 300, 10
 CurrentSensorthread.start()
 threads.append(CurrentSensorthread)
 
-if args.analemma != '' or args.moonanalemma != '':
+if args.analemma is not None or args.moonanalemma is not None:
     # initialize scheduler with UTC time
     scheduler = BackgroundScheduler(timezone=utc.zone)
     scheduler.start()
-    if args.analemma != '':
+    if args.analemma is not None:
         # Calculate trigger UTC time from mean local time
         delay = args.delayDaytime/1000 # Time (in sec) to shift taking analemma pictures when now is specified and time difference to start blocking normal pictures in main loop
         if args.analemma.lower() == 'meanmidday':
@@ -2905,7 +2914,7 @@ if args.analemma != '' or args.moonanalemma != '':
         print('                      local : %s' % analemmatrigger.replace(tzinfo=datetime.timezone.utc).astimezone(tz=datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo).strftime("%H:%M:%S"))
         scheduler.add_job(switchblock, trigger='cron', args=[True], hour=analemmablock.time().hour, minute=analemmablock.time().minute, second=analemmablock.time().second, id='sunblockexposure')
         scheduler.add_job(getanalemma, trigger='cron', args=[args, camera, pixelstorage, nparraytype, ''], hour=analemmatrigger.time().hour, minute=analemmatrigger.time().minute, second=analemmatrigger.time().second, id='sunanalemmaexposure')
-    if args.moonanalemma != '':
+    if args.moonanalemma is not None:
         # Calculate trigger UTC time from specified time difference to transit time
         moon = ephem.Moon()
         position.date = datetime.datetime.utcnow()
@@ -3038,265 +3047,276 @@ while bMain:
 
             while bMain and lastisday == isday(False):
 
-                # Check dew heater control parameters and decide if it needs
-                # to be switched on or off depending on the ambient temperature
-                # and the calculated dew-point
-                if not isday(False):
-                    heaterControl(IRSensorthread.Tobj, weatherthread.dewpoint, sensitivity=1.5, hysteresis=5.0)
-                # read image as bytearray from camera
-                print("Starting Exposure (looptime: 0 secs)")
-                reftime = datetime.datetime.now()
-                if 'timing' in args.debug or 'memory' in args.debug:
-                    print("--------------------Loop Start-------------------------")
-                    print("Before frame readout:")
-                    if 'timing' in args.debug:
-                        print("==>looptime: 0 secs")
-                    if 'memory' in args.debug:
-                        print("==>Memory  : %s %%" % psutil.virtual_memory()[2])
-
-                try:
-                    camera.capture(buffer_=imgarray, filename=None)
-                except:
-                    print("Exposure timeout, increasing exposure time\n")
-
-                if 'timing' in args.debug or 'memory' in args.debug:
-                    print("After frame readout:")
-                    if 'timing' in args.debug:
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    if 'memory' in args.debug:
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-
-                print("Stopping Exposure")
-                # Get current time
-                timestring = datetime.datetime.now()
-                # Define file base string (for image and image info file)
-                filebase = args.dirtime_12h_ago_path+'/'+args.filename[:-4]+timestring.strftime("%Y%m%d%H%M%S")
-                # convert bytearray to numpy array
-                nparray = np.frombuffer(imgarray, nparraytype)
-
-                if 'timing' in args.debug or 'memory' in args.debug:
-                    print("After nparray assignment:")
-                    if 'timing' in args.debug:
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    if 'memory' in args.debug:
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-
-                # Debayer image in the case of RAW8 or RAW16 images
-                if args.dodebayer:
-                    # reshape numpy array back to image matrix depending on image type.
-                    # take care that opencv channel order is B,G,R instead of R,G,B
-                    imgbay = nparray.reshape((args.height, args.width, args.channels))
-                    cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+bayerpatt[bayerindx][2:][::-1]+\
-                                           '2BGR'+debayeralgext), img, 0)
-                else:
-                    # reshape numpy array back to image matrix depending on image type
-                    img = nparray.reshape((args.height, args.width, args.channels))
-
-                if 'timing' in args.debug or 'memory' in args.debug:
-                    if args.dodebayer:
-                        print("After array reshaping:")
+                if blockimaging:
+                    # Switched on during taking of analemmas (sun and moon)
+                    # Then the routine just waits for the time delayDaytime in ms at day
+                    # and for delay in ms at night
+                    if 'info' in args.debug:
+                        print("Taking analemma... timelapse image capture interrupted")
+                    if lastisday:
+                        time.sleep(args.delayDaytime/1000)
                     else:
-                        print("After array reshaping and debayering:")
-
-                    if 'timing' in args.debug:
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    if 'memory' in args.debug:
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-
-                # read current camera parameters
-                autoExp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
-                autoGain = camera.get_control_value(asi.ASI_GAIN)[0]
-
-                # Adjust exposure and gain if autoexp or autogain has been set respectively
-                if args.autoexposure:
-                    autoExp = getexposureoptimum(args, camera)
-                if args.autogain:
-                    # calculate histogram from image converted into grayscale
-                    gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).astype('uint8')
-                    hist = cv2.calcHist([gray], [0], (cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)).astype('uint8'), [256], [0, 255])
-                    cv2.normalize(hist, hist, alpha=0, beta=1.0, norm_type=cv2.NORM_MINMAX)
-                    # Get exposure measure by calculating skew around middle gray (128) => See Chen2017.pdf
-                    np.roll(histmu, -1)
-                    histmu[2] = 0
-                    for k, p in enumerate(hist):
-                        histmu[2] += (k-128)**3*p
-
-                    if 'debug' in args.debug:
-                        print("Auto Gain score: %.2f" % histmu[2])
-
-                    #Implement PI control (see Rossi2012)
-                    autoGainstep = -int(getPIDcontrolvalue(args.delayDaytime if lastisday else args.delay, histmu, kc=1/200000))
-                    print("Auto Gain step: %d" % autoGainstep)
-                    autoGain += autoGainstep
-                    if autoGain > args.maxgain:
-                        autoGain = args.maxgain
-                    if autoGain < 0:
-                        autoGain = 0
-
-                # postprocess image
-                # If aperture should be masked, apply circular masking
-                if args.maskaperture != False: #pylint: disable=C0121
-                    #Do mask operation
-
-                    if 'timing' in args.debug or 'memory' in args.debug:
-                        print("Before masking:")
-                        if 'timing' in args.debug:
-                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                        if 'memory' in args.debug:
-                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-
-                    img *= mask
-
-                    if 'timing' in args.debug or 'memory' in args.debug:
-                        print("After masking:")
-                        if 'timing' in args.debug:
-                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                        if 'memory' in args.debug:
-                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-
-                # If time parameter is specified, print timestring
-                #(in brackets if text parameter is given as well)
-                caption = args.text
-                if args.time and args.text != "":
-                    caption = caption + "(" + timestring.strftime("%d.%b.%Y %X") + ")"
-                elif args.time:
-                    caption = timestring.strftime("%d.%b.%Y %X")
-                print('Caption: %s' % caption)
-                if args.takedarkframe == '':
-
-                    if 'timing' in args.debug or 'memory' in args.debug:
-                        print('Writing image caption:')
-                        if 'timing' in args.debug:
-                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                        if 'memory' in args.debug:
-                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-
-                    lasty = _stamptext(img, caption, 0, args)
-                    if args.details:
-                        #Output into to left corner of the image underneath the Date-Time Caption
-                        dargs = copy.deepcopy(args)
-                        dargs.fontscale = args.fontscale*0.8
-                        caption = str('Sensor {:.1f}degC'.\
-                                      format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
-                        lasty = _stamptext(img, caption, lasty, dargs)
-                        if lastisday and autoExp < 1000000:
-                            caption = 'Exposure {:.3f} ms'.format(autoExp/1000)
-                        else:
-                            caption = 'Exposure {:.3f} s'.format(autoExp/1000000)
-                        lasty = _stamptext(img, caption, lasty, dargs)
-                        caption = str('Gain {:d}'.format(autoGain))
-                        lasty = _stamptext(img, caption, lasty, dargs)
-                        #Output into the bottom left corner of the image
-                        caption = str('TDew {:.1f}degC'.\
-                                 format(weatherthread.dewpoint))
-                        lasty = _stamptext(img, caption, dargs.height, dargs, top=False)
-                        caption = str('TExt {:.1f}degC'.\
-                                 format(weatherthread.temperature))
-                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('TDome {:.1f}degC'.\
-                                 format(IRSensorthread.Tobj))
-                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('TIRAmb {:.1f}degC'.\
-                                 format(IRSensorthread.Ta))
-                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('THouse {:.1f}degC'.\
-                                 format(dht22thread.dht22temp))
-                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('TDewHouse {:.1f}degC'.\
-                                 format(dht22thread.dewpoint))
-                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('RHHouse {:.1f}%'.\
-                                 format(dht22thread.dht22hum))
-                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        caption = str('RHExt {:.1f}%'.\
-                                 format(weatherthread.humidity))
-                        lasty = _stamptext(img, caption, lasty, dargs, top=False)
-                        #Output into the top right corner of the image
-                        caption = str('Bus Power {:.3f}mW'.\
-                                 format(CurrentSensorthread.power))
-                        lasty = _stamptext(img, caption, 0, dargs, left=False, top=True)
-                        if heateron():
-                            caption = 'Heater is ON'
-                        else:
-                            caption = 'Heater is OFF'
-                        lasty = _stamptext(img, caption, lasty, dargs, left=False, top=True)
-
-                        if 'info' in args.debug:
-                            if 'timing' in args.debug or 'memory' in args.debug:
-                                print("Image Caption written:")
-                                if 'timing' in args.debug:
-                                    print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                                if 'memory' in args.debug:
-                                    print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-
-                # write image
-                if 'timing' in args.debug or 'memory' in args.debug:
-                    print("Before image writing thread start:")
-                    if 'timing' in args.debug:
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    if 'memory' in args.debug:
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-
-                if focuscounter == -1:
-                    thread = saveThread(filebase+'.'+args.extension, img, camera, args, timestring)
+                        time.sleep(args.delay/1000)
                 else:
-                    thread = saveThread(args.dirtime_12h_ago_path+'/'+args.filename[:-4]+'_focus_'+'{:02d}'.format(focuscounter)+'.'+args.extension, img, camera, args, timestring)
-                thread.start()
-                threads.append(thread)
+                    # Check dew heater control parameters and decide if it needs
+                    # to be switched on or off depending on the ambient temperature
+                    # and the calculated dew-point
+                    if not isday(False):
+                        heaterControl(IRSensorthread.Tobj, weatherthread.dewpoint, sensitivity=1.5, hysteresis=5.0)
+                    # read image as bytearray from camera
+                    print("Starting Exposure (looptime: 0 secs)")
+                    reftime = datetime.datetime.now()
+                    if 'timing' in args.debug or 'memory' in args.debug:
+                        print("--------------------Loop Start-------------------------")
+                        print("Before frame readout:")
+                        if 'timing' in args.debug:
+                            print("==>looptime: 0 secs")
+                        if 'memory' in args.debug:
+                            print("==>Memory  : %s %%" % psutil.virtual_memory()[2])
 
-                # Reduce focusscale counter if specified and move stepper motor by focusstep
-                if focuscounter > 0:
-                    focuscounter -= 1
-                    if focusstepwidth < 0:
-                        print("Moving focus motor backward by %d (%d exposures remaining)." % (-focusstepwidth, focuscounter))
-                        myStepper.step(-focusstepwidth, NanoHatMotor.BACKWARD, NanoHatMotor.INTERLEAVE)
-                    elif focusstepwidth > 0:
-                        print("Moving focus motor forward by %d (%d exposures remaining)." % (focusstepwidth, focuscounter))
-                        myStepper.step(+focusstepwidth, NanoHatMotor.FORWARD, NanoHatMotor.INTERLEAVE)
-                elif focuscounter == 0:
-                    bMain = False
-                    if focusstepwidth < 0:
-                        print("Moving focus motor back to original position by %d (%d exposures done)." % (-focusstepwidth*focusframes, focusframes))
-                        myStepper.step(-focusstepwidth*focusframes, NanoHatMotor.FORWARD, NanoHatMotor.INTERLEAVE)
-                    elif focusstepwidth > 0:
-                        print("Moving focus motor back to original position by %d (%d exposures done)." % (+focusstepwidth*focusframes, focusframes))
-                        myStepper.step(+focusstepwidth*focusframes, NanoHatMotor.BACKWARD, NanoHatMotor.INTERLEAVE)
+                    try:
+                        camera.capture(buffer_=imgarray, filename=None)
+                    except:
+                        print("Exposure timeout, increasing exposure time\n")
 
-                if 'timing' in args.debug or 'memory' in args.debug:
-                    print("Before delay timestep:")
-                    if 'timing' in args.debug:
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    if 'memory' in args.debug:
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                    if 'timing' in args.debug or 'memory' in args.debug:
+                        print("After frame readout:")
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
-                if args.autogain:
-                    print("Auto Gain value: %d\n" % autoGain)
-                    camera.set_control_value(asi.ASI_GAIN, autoGain, auto=True)
+                    print("Stopping Exposure")
+                    # Get current time
+                    timestring = datetime.datetime.now()
+                    # Define file base string (for image and image info file)
+                    filebase = args.dirtime_12h_ago_path+'/'+args.filename[:-4]+timestring.strftime("%Y%m%d%H%M%S")
+                    # convert bytearray to numpy array
+                    nparray = np.frombuffer(imgarray, nparraytype)
 
-                if args.autoexposure:
-                    print("Auto Exposure value: %d ms\n" % round(autoExp/1000))
-                    camera.set_control_value(asi.ASI_EXPOSURE, autoExp, auto=True)
+                    if 'timing' in args.debug or 'memory' in args.debug:
+                        print("After nparray assignment:")
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
 
-                # if the actual time elapsed since start of the loop is less
-                # than the delay or delayDaytime parameter,
-                # we still wait until we reach the required time elapsed.
-                # This is important for a constant frame rate during timelapse generation
-                timediff = (datetime.datetime.now()-reftime).total_seconds()
-                if lastisday:
-                    waittime = args.delayDaytime/1000.0-timediff
-                else:
-                    waittime = args.delay/1000.0-timediff
-                if waittime > 0:
-                    print("Sleeping %.2f s\n" % waittime)
-                    time.sleep(waittime)
+                    # Debayer image in the case of RAW8 or RAW16 images
+                    if args.dodebayer:
+                        # reshape numpy array back to image matrix depending on image type.
+                        # take care that opencv channel order is B,G,R instead of R,G,B
+                        imgbay = nparray.reshape((args.height, args.width, args.channels))
+                        cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+bayerpatt[bayerindx][2:][::-1]+\
+                                               '2BGR'+debayeralgext), img, 0)
+                    else:
+                        # reshape numpy array back to image matrix depending on image type
+                        img = nparray.reshape((args.height, args.width, args.channels))
 
-                if 'timing' in args.debug or 'memory' in args.debug:
-                    print("At end of loop:")
-                    if 'timing' in args.debug:
-                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
-                    if 'memory' in args.debug:
-                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
-                    print("---------------------Loop End--------------------------")
+                    if 'timing' in args.debug or 'memory' in args.debug:
+                        if args.dodebayer:
+                            print("After array reshaping:")
+                        else:
+                            print("After array reshaping and debayering:")
+
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
+                    # read current camera parameters
+                    autoExp = camera.get_control_value(asi.ASI_EXPOSURE)[0] # in us
+                    autoGain = camera.get_control_value(asi.ASI_GAIN)[0]
+
+                    # Adjust exposure and gain if autoexp or autogain has been set respectively
+                    if args.autoexposure:
+                        autoExp = getexposureoptimum(args, camera)
+                    if args.autogain:
+                        # calculate histogram from image converted into grayscale
+                        gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).astype('uint8')
+                        hist = cv2.calcHist([gray], [0], (cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)).astype('uint8'), [256], [0, 255])
+                        cv2.normalize(hist, hist, alpha=0, beta=1.0, norm_type=cv2.NORM_MINMAX)
+                        # Get exposure measure by calculating skew around middle gray (128) => See Chen2017.pdf
+                        np.roll(histmu, -1)
+                        histmu[2] = 0
+                        for k, p in enumerate(hist):
+                            histmu[2] += (k-128)**3*p
+
+                        if 'debug' in args.debug:
+                            print("Auto Gain score: %.2f" % histmu[2])
+
+                        #Implement PI control (see Rossi2012)
+                        autoGainstep = -int(getPIDcontrolvalue(args.delayDaytime if lastisday else args.delay, histmu, kc=1/200000))
+                        print("Auto Gain step: %d" % autoGainstep)
+                        autoGain += autoGainstep
+                        if autoGain > args.maxgain:
+                            autoGain = args.maxgain
+                        if autoGain < 0:
+                            autoGain = 0
+
+                    # postprocess image
+                    # If aperture should be masked, apply circular masking
+                    if args.maskaperture != False: #pylint: disable=C0121
+                        #Do mask operation
+
+                        if 'timing' in args.debug or 'memory' in args.debug:
+                            print("Before masking:")
+                            if 'timing' in args.debug:
+                                print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                            if 'memory' in args.debug:
+                                print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
+                        img *= mask
+
+                        if 'timing' in args.debug or 'memory' in args.debug:
+                            print("After masking:")
+                            if 'timing' in args.debug:
+                                print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                            if 'memory' in args.debug:
+                                print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
+                    # If time parameter is specified, print timestring
+                    #(in brackets if text parameter is given as well)
+                    caption = args.text
+                    if args.time and args.text != "":
+                        caption = caption + "(" + timestring.strftime("%d.%b.%Y %X") + ")"
+                    elif args.time:
+                        caption = timestring.strftime("%d.%b.%Y %X")
+                    print('Caption: %s' % caption)
+                    if args.takedarkframe == '':
+
+                        if 'timing' in args.debug or 'memory' in args.debug:
+                            print('Writing image caption:')
+                            if 'timing' in args.debug:
+                                print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                            if 'memory' in args.debug:
+                                print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
+                        lasty = _stamptext(img, caption, 0, args)
+                        if args.details:
+                            #Output into to left corner of the image underneath the Date-Time Caption
+                            dargs = copy.deepcopy(args)
+                            dargs.fontscale = args.fontscale*0.8
+                            caption = str('Sensor {:.1f}degC'.\
+                                          format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
+                            lasty = _stamptext(img, caption, lasty, dargs)
+                            if lastisday and autoExp < 1000000:
+                                caption = 'Exposure {:.3f} ms'.format(autoExp/1000)
+                            else:
+                                caption = 'Exposure {:.3f} s'.format(autoExp/1000000)
+                            lasty = _stamptext(img, caption, lasty, dargs)
+                            caption = str('Gain {:d}'.format(autoGain))
+                            lasty = _stamptext(img, caption, lasty, dargs)
+                            #Output into the bottom left corner of the image
+                            caption = str('TDew {:.1f}degC'.\
+                                     format(weatherthread.dewpoint))
+                            lasty = _stamptext(img, caption, dargs.height, dargs, top=False)
+                            caption = str('TExt {:.1f}degC'.\
+                                     format(weatherthread.temperature))
+                            lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                            caption = str('TDome {:.1f}degC'.\
+                                     format(IRSensorthread.Tobj))
+                            lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                            caption = str('TIRAmb {:.1f}degC'.\
+                                     format(IRSensorthread.Ta))
+                            lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                            caption = str('THouse {:.1f}degC'.\
+                                     format(dht22thread.dht22temp))
+                            lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                            caption = str('TDewHouse {:.1f}degC'.\
+                                     format(dht22thread.dewpoint))
+                            lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                            caption = str('RHHouse {:.1f}%'.\
+                                     format(dht22thread.dht22hum))
+                            lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                            caption = str('RHExt {:.1f}%'.\
+                                     format(weatherthread.humidity))
+                            lasty = _stamptext(img, caption, lasty, dargs, top=False)
+                            #Output into the top right corner of the image
+                            caption = str('Bus Power {:.3f}mW'.\
+                                     format(CurrentSensorthread.power))
+                            lasty = _stamptext(img, caption, 0, dargs, left=False, top=True)
+                            if heateron():
+                                caption = 'Heater is ON'
+                            else:
+                                caption = 'Heater is OFF'
+                            lasty = _stamptext(img, caption, lasty, dargs, left=False, top=True)
+
+                            if 'info' in args.debug:
+                                if 'timing' in args.debug or 'memory' in args.debug:
+                                    print("Image Caption written:")
+                                    if 'timing' in args.debug:
+                                        print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                                    if 'memory' in args.debug:
+                                        print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
+                    # write image
+                    if 'timing' in args.debug or 'memory' in args.debug:
+                        print("Before image writing thread start:")
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
+                    if focuscounter == -1:
+                        thread = saveThread(filebase+'.'+args.extension, img, camera, args, timestring)
+                    else:
+                        thread = saveThread(args.dirtime_12h_ago_path+'/'+args.filename[:-4]+'_focus_'+'{:02d}'.format(focuscounter)+'.'+args.extension, img, camera, args, timestring)
+                    thread.start()
+                    threads.append(thread)
+
+                    # Reduce focusscale counter if specified and move stepper motor by focusstep
+                    if focuscounter > 0:
+                        focuscounter -= 1
+                        if focusstepwidth < 0:
+                            print("Moving focus motor backward by %d (%d exposures remaining)." % (-focusstepwidth, focuscounter))
+                            myStepper.step(-focusstepwidth, NanoHatMotor.BACKWARD, NanoHatMotor.INTERLEAVE)
+                        elif focusstepwidth > 0:
+                            print("Moving focus motor forward by %d (%d exposures remaining)." % (focusstepwidth, focuscounter))
+                            myStepper.step(+focusstepwidth, NanoHatMotor.FORWARD, NanoHatMotor.INTERLEAVE)
+                    elif focuscounter == 0:
+                        bMain = False
+                        if focusstepwidth < 0:
+                            print("Moving focus motor back to original position by %d (%d exposures done)." % (-focusstepwidth*focusframes, focusframes))
+                            myStepper.step(-focusstepwidth*focusframes, NanoHatMotor.FORWARD, NanoHatMotor.INTERLEAVE)
+                        elif focusstepwidth > 0:
+                            print("Moving focus motor back to original position by %d (%d exposures done)." % (+focusstepwidth*focusframes, focusframes))
+                            myStepper.step(+focusstepwidth*focusframes, NanoHatMotor.BACKWARD, NanoHatMotor.INTERLEAVE)
+
+                    if 'timing' in args.debug or 'memory' in args.debug:
+                        print("Before delay timestep:")
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+
+                    if args.autogain:
+                        print("Auto Gain value: %d\n" % autoGain)
+                        camera.set_control_value(asi.ASI_GAIN, autoGain, auto=True)
+
+                    if args.autoexposure:
+                        print("Auto Exposure value: %d ms\n" % round(autoExp/1000))
+                        camera.set_control_value(asi.ASI_EXPOSURE, autoExp, auto=True)
+
+                    # if the actual time elapsed since start of the loop is less
+                    # than the delay or delayDaytime parameter,
+                    # we still wait until we reach the required time elapsed.
+                    # This is important for a constant frame rate during timelapse generation
+                    timediff = (datetime.datetime.now()-reftime).total_seconds()
+                    if lastisday:
+                        waittime = args.delayDaytime/1000.0-timediff
+                    else:
+                        waittime = args.delay/1000.0-timediff
+                    if waittime > 0:
+                        print("Sleeping %.2f s\n" % waittime)
+                        time.sleep(waittime)
+
+                    if 'timing' in args.debug or 'memory' in args.debug:
+                        print("At end of loop:")
+                        if 'timing' in args.debug:
+                            print("==>looptime: %f secs" % (datetime.datetime.now()-reftime).total_seconds())
+                        if 'memory' in args.debug:
+                            print("==>Memory: %s %%" % psutil.virtual_memory()[2])
+                        print("---------------------Loop End--------------------------")
 
                 if not(lastisday) and isday(False):
                     # Switch off heater
@@ -3319,7 +3339,7 @@ CurrentSensorstopFlag.set()
 turnoffHeater()
 
 # Finally wait for all threads to complete
-if args.analemma != '' or args.moonanalemma != '':
+if args.analemma is not None or args.moonanalemma is not None:
     scheduler.shutdown()
 for t in threads:
     t.join()
