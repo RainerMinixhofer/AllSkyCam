@@ -34,10 +34,10 @@ from metpy.units import units
 from pytz import utc
 from astropy.io import fits
 from skimage.feature import blob_doh
-from matplotlib import pyplot as plt # pylint: disable=C0412
-import matplotlib.patches as patches # pylint: disable=C0412
-import cv2 # pylint: disable=E0401
-import ephem # pylint: disable=E0401
+from matplotlib import pyplot as plt
+import matplotlib.patches as patches
+import cv2
+import ephem
 import smbus # pylint: disable=E0401
 import zwoasi as asi # pylint: disable=E0401
 from apscheduler.schedulers.background import BackgroundScheduler # pylint: disable=E0401
@@ -377,10 +377,10 @@ def postprocess(args, camera):
         imgfiles = sorted(glob.glob(args.dirtime_12h_ago_path+'/'+args.filename[:-4]+"*."+args.extension))
         #Get image dimensions and channels from first image
         image = cv2.imread(imgfiles[0])
-        args.height, args.width, args.channels = image.shape
+        height, width, channels = image.shape
 
         if 'debug' in args.debug:
-            print("->Postprocess: Dimensions of first image: H=%d/W=%d/CH=%d" % (args.height, args.width, args.channels))
+            print("->Postprocess: Dimensions of first image: H=%d/W=%d/CH=%d" % (height, width, channels))
 
         starttime = datetime.datetime.strptime(re.findall("\d+\.", imgfiles[0])[-1][:-1], '%Y%m%d%H%M%S')
         prevtime = starttime
@@ -393,7 +393,7 @@ def postprocess(args, camera):
             print("->Postprocess: Exporting images to video")
             vidfile = args.dirtime_12h_ago_path+'/'+args.video[:-4]+args.dirtime_12h_ago+args.video[-4:]
             vid = cv2.VideoWriter(vidfile, cv2.VideoWriter_fourcc(*'mp4v'), \
-                                  args.framerate, (args.width, args.height))
+                                  args.framerate, (width, height))
         for idx, imgfile in enumerate(imgfiles):
             try:
                 image = cv2.imread(imgfile)
@@ -469,22 +469,22 @@ def postprocess(args, camera):
             if startrails is None:
                 print('->Postprocess: No images below threshold, writing the minimum image only')
                 startrails = cv2.imread(imgfiles[min_loc[1]], cv2.IMREAD_UNCHANGED)
+            else:
+                #Apply mask to remove mangled labels
+                mask = getmask(args, startrails.dtype)
+                startrails *= mask
+                #Label time interval of startrails if args.time is set
+                if args.time:
+                    print("->Postprocess: Writing Caption to star trails")
+                    caption = ["from " + startrails_tstart.strftime("%d.%b.%Y %X"), \
+                               "to   " + startrails_tend.strftime("%d.%b.%Y %X")]
+                    if 'debug' in args.debug:
+                        print("->Postprocess: Caption is: %s, %s" % (caption[0], caption[1]))
 
-            #Apply mask to remove mangled labels
-            mask = getmask(args, startrails.dtype)
-            startrails *= mask
-            #Label time interval of startrails if args.time is set
-            if args.time:
-                print("->Postprocess: Writing Caption to star trails")
-                caption = ["from " + startrails_tstart.strftime("%d.%b.%Y %X"), \
-                           "to   " + startrails_tend.strftime("%d.%b.%Y %X")]
-                if 'debug' in args.debug:
-                    print("->Postprocess: Caption is: %s, %s" % (caption[0], caption[1]))
-
-                if args.text != "":
-                    caption = args.text + "\n" + caption
-                lasty = _stamptext(startrails, caption[0], 0, args)
-                lasty = _stamptext(startrails, caption[1], lasty, args)
+                    if args.text != "":
+                        caption = args.text + "\n" + caption
+                    lasty = _stamptext(startrails, caption[0], 0, args)
+                    lasty = _stamptext(startrails, caption[1], lasty, args)
 
             startfile = args.dirtime_12h_ago_path+'/'+args.startrailsoutput[:-4]+args.dirtime_12h_ago+args.startrailsoutput[-4:]
             status = writeImage(startfile, startrails, camera, args, datetime.datetime.now())
@@ -1080,14 +1080,15 @@ def heateron():
     """
     return not pinisinput(33) and pinstatus(33)
 
-def heaterControl(tambient, tdewpoint, sensitivity=1.5, hysteresis=1.0):
+def heaterControl(tambient, tdewpoint, focusscale, sensitivity=1.5, hysteresis=1.0):
     """
     Switches Dew Heater on and off depending on difference between the ambient
     temperature <tambient> and the dew point <tdewpoint>. The default difference
     is given by sensitivity. Thus the heater switches on at
     tambient - tdewpoint < sensitivity
     and off at
-    tambient - tdewpoint > sensitivity + hysteresis
+    tambient - tdewpoint > sensitivity + hysteresis.
+    If focusscale is run, heater is always turned off, to conserve power for turning the stepper motor.
 
     Parameters
     ----------
@@ -1102,8 +1103,7 @@ def heaterControl(tambient, tdewpoint, sensitivity=1.5, hysteresis=1.0):
     None.
 
     """
-
-    if not heateron() and tambient - tdewpoint < sensitivity:
+    if not heateron() and tambient - tdewpoint < sensitivity and focusscale == '':
         turnonHeater()
         #Write data of MLX90614 IR sensor into Homematic
         try:
@@ -1113,7 +1113,7 @@ def heaterControl(tambient, tdewpoint, sensitivity=1.5, hysteresis=1.0):
         if r.status_code != requests.codes['ok']:
             print("-> heaterControl: Data could not be written into the Homatic system variable.")
         print("\n\n-> heaterControl: Dew Heater turned on(Ta=%f,Td=%f)\n\n" % (tambient, tdewpoint))
-    elif heateron() and tambient - tdewpoint > sensitivity + hysteresis:
+    elif (heateron() and tambient - tdewpoint > sensitivity + hysteresis) or focusscale != '':
         turnoffHeater()
         try:
             r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=0")
@@ -1823,7 +1823,7 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     # Start with smallest exposure time
     times = list(reversed(times))
 
-    imgarray = bytearray(args.width*args.height*pixelstorage)
+    anaarray = bytearray(args.width*args.height*pixelstorage)
 
     # Do loop over exposures scaling them with a factor of 2
 
@@ -1832,25 +1832,25 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
     for i, exposure in enumerate(times):
         camera.set_control_value(controls['Exposure']['ControlType'], exposure, auto=False)
 
-        camera.capture(buffer_=imgarray, filename=None)
+        camera.capture(buffer_=anaarray, filename=None)
 
         print("Exposure: %d us" % exposure)
 
         # convert bytearray to numpy array
-        nparray = np.frombuffer(imgarray, nparraytype)
+        array = np.frombuffer(anaarray, nparraytype)
         # reshape numpy array back to image matrix depending on image type.
-        imgbay = nparray.reshape((args.height, args.width, args.channels))
+        anabay = array.reshape((args.height, args.width, args.channels))
 
         # Debayer image in the case of RAW8 or RAW16 images
         if args.dodebayer:
             # Define image array here, to ensure that an image array is generated with imgs.append below
             img = np.zeros((args.height, args.width, 3), nparraytype)
             # take care that opencv channel order is B,G,R instead of R,G,B
-            cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+\
+            cv2.cvtColor(anabay, eval('cv2.COLOR_BAYER_'+\
                                       bayerpatt[bayerindx][2:][::-1]+\
                                       '2BGR'+debayeralgext), img, 0)
         else:
-            img = np.copy(imgbay)
+            img = np.copy(anabay)
 
         # postprocess image
         # If aperture should be masked, apply circular masking
@@ -1860,6 +1860,10 @@ def getanalemma(args, camera, pixelstorage, nparraytype, prefix):
 
         # save image and exposure time into array for postprocessing
         imgs.append(img)
+
+    anaarray = None
+    anabay = None
+    array = None
 
     print(prefix+"Analemma HDR frame capture finished.")
 
@@ -1934,32 +1938,37 @@ def getaperture(args, camera, configfile, overexposure=10, threshold=128, minfea
     origroi = camera.get_roi()
     camera.set_roi(start_x=None, start_y=None, width=maxwidth, height=maxheight)
 
-    imgarray = bytearray(maxwidth*maxheight*pixelstorage)
+    aparray = bytearray(maxwidth*maxheight*pixelstorage)
 
     # Do loop over exposures scaling them with a factor of 2
 
     camera.set_control_value(controls['Gain']['ControlType'], 1)
     camera.set_control_value(controls['Exposure']['ControlType'], exposure, auto=False)
 
-    camera.capture(buffer_=imgarray, filename=None)
+    camera.capture(buffer_=aparray, filename=None)
 
     print("Exposure setting: %d us" % exposure)
 
     # convert bytearray to numpy array
-    nparray = np.frombuffer(imgarray, nparraytype)
+    array = np.frombuffer(aparray, nparraytype)
     # reshape numpy array back to image matrix depending on image type.
-    imgbay = nparray.reshape((maxheight, maxwidth, args.channels))
+    apbay = array.reshape((maxheight, maxwidth, args.channels))
 
     # Debayer image in the case of RAW8 or RAW16 images
     if args.dodebayer:
         # Define image array here, to ensure that an image array is generated with imgs.append below
         img = np.zeros((maxheight, maxwidth, 3), nparraytype)
         # take care that opencv channel order is B,G,R instead of R,G,B
-        cv2.cvtColor(imgbay, eval('cv2.COLOR_BAYER_'+\
+        cv2.cvtColor(apbay, eval('cv2.COLOR_BAYER_'+\
                                   bayerpatt[bayerindx][2:][::-1]+\
                                   '2BGR'+debayeralgext), img, 0)
     else:
-        img = np.copy(imgbay)
+        img = np.copy(apbay)
+
+    apbay = None
+    aparray = None
+    array = None
+
     if 'info' in args.debug:
         cv2.imwrite(os.path.join(args.dirname, 'aperture_orig.png'), img)
     #convert into 8bit grayscale image
@@ -2111,7 +2120,7 @@ def is_number(s):
         pass
 
     try:
-        import unicodedata
+        import unicodedata #pylint: disable=C0415
         unicodedata.numeric(s)
         return True
     except (TypeError, ValueError):
@@ -2557,10 +2566,10 @@ args.extension = args.filename.lower().split('.')[-1]
 # Check validity of parameters
 if args.lat[-1] not in ['N', 'S']:
     print('Latitude specification must be a degree float ending with "N" or "S"')
-    exit()
+    sys.exit()
 if args.lon[-1] not in ['W', 'E']:
     print('Longitude specification must be a degree float ending with "W" or "E"')
-    exit()
+    sys.exit()
 if args.lat[-1] == 'S':
     args.lat = -float(args.lat[:-2])
 else:
@@ -2571,10 +2580,10 @@ else:
     args.lon = float(args.lon[:-2])
 if not 0 <= args.pngcompression <= 9:
     print('PNG File compression setting has to be in the interval [0,9]')
-    exit()
+    sys.exit()
 if not 0 <= args.jpgquality <= 100:
     print('JPG compression quality setting has to be in the interval [0,100]')
-    exit()
+    sys.exit()
 if not is_number(args.twilight):
     tl = args.twilight.lower()
     if tl[:5] == 'civil':
@@ -2585,7 +2594,7 @@ if not is_number(args.twilight):
         args.twilightalt = -12
     else:
         print('Wrong --twilight argument. Should read Civil, Astronomical or Nautical!')
-        exit()
+        sys.exit()
 else:
     args.twilightalt = args.twilight
 if args.debayeralg.lower() in ['none', 'bilinear', 'bl', 'variablenumberofgradients', \
@@ -2594,7 +2603,7 @@ if args.debayeralg.lower() in ['none', 'bilinear', 'bl', 'variablenumberofgradie
         debayeralgext = ''
     elif (args.debayeralg.lower() in ['vng', 'variablenumberofgradients']) and args.type == 2:
         print('debayer algorithm VNG just available for RAW8 images')
-        exit()
+        sys.exit()
     elif args.debayeralg.lower() in ['vng', 'variablenumberofgradients']:
         debayeralgext = '_VNG'
     elif args.debayeralg.lower() in ['ea', 'edgeaware']:
@@ -2602,7 +2611,7 @@ if args.debayeralg.lower() in ['none', 'bilinear', 'bl', 'variablenumberofgradie
 else:
     print('Wrong --debayeralg argument. Should read none, bilinear/bl, \
     variablenumberofgradients/vng or edgeaware/ea')
-    exit()
+    sys.exit()
 if isinstance(args.fontname, str):
     print('Font: %s specified' % args.fontname)
     args.ftfont = cv2.freetype.createFreeType2()
@@ -2837,10 +2846,13 @@ if args.focusscale != '':
     focusframes, focusstepwidth = map(int, args.focusscale.split(','))
     focuscounter = focusframes
     print("Running focus scale with %i steps of %i stepwidth" % (focusframes, focusstepwidth))
+    # Ensure that heater is turned off to conserve power for stepper motor
+    turnoffHeater()
     mh = NanoHatMotor(freq=200)
     atexit.register(turnOffMotors)
     myStepper = mh.getStepper(200, 1)      # motor port #1
     myStepper.setSpeed(5)                  # 5 RPM
+    
 
 else:
     focuscounter = -1
@@ -2856,7 +2868,7 @@ if args.postprocessonly:
     args.dirtime_12h_ago = os.path.basename(os.path.normpath(args.dirtime_12h_ago_path))
     postprocess(args, camera)
     camera.close()
-    exit()
+    sys.exit()
 
 # Get Aperture dimensions and save it into configuration file given by getaperture parameter
 if args.getaperture != '':
@@ -2866,7 +2878,7 @@ if args.getaperture != '':
     configfile, overexposure, threshold, minfeaturesize = args.getaperture.split(',')
 
     getaperture(args, camera, configfile, overexposure=float(overexposure), threshold=int(threshold), minfeaturesize=int(minfeaturesize))
-    exit()
+    sys.exit()
 
 #Start Temperature and Humidity-Monitoring with DHT22 sensor. Read out every 5min (300sec) and timeout after 10sec
 
@@ -3062,7 +3074,7 @@ while bMain:
                     # to be switched on or off depending on the ambient temperature
                     # and the calculated dew-point
                     if not isday(False):
-                        heaterControl(IRSensorthread.Tobj, weatherthread.dewpoint, sensitivity=1.5, hysteresis=5.0)
+                        heaterControl(IRSensorthread.Tobj, weatherthread.dewpoint, args.focusscale, sensitivity=1.5, hysteresis=5.0)
                     # read image as bytearray from camera
                     print("Starting Exposure (looptime: 0 secs)")
                     reftime = datetime.datetime.now()
