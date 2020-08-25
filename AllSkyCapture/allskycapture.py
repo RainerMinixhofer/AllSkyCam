@@ -13,6 +13,7 @@ matplotlib.use('Agg')
 import sys
 import argparse
 import os
+from sh import mount # pylint: disable=E0401
 import logging
 import time
 import subprocess
@@ -29,15 +30,15 @@ import psutil
 import requests
 import numpy as np
 from scipy import optimize
-import metpy.calc as mcalc
-from metpy.units import units
+import metpy.calc as mcalc # pylint: disable=E0401
+from metpy.units import units # pylint: disable=E0401
 from pytz import utc
 from astropy.io import fits
 from skimage.feature import blob_doh
 from matplotlib import pyplot as plt
 import matplotlib.patches as patches
-import cv2
-import ephem
+import cv2 # pylint: disable=E0401
+import ephem # pylint: disable=E0401
 import smbus # pylint: disable=E0401
 import zwoasi as asi # pylint: disable=E0401
 from apscheduler.schedulers.background import BackgroundScheduler # pylint: disable=E0401
@@ -56,6 +57,7 @@ threads = []
 meantranstimemoon = datetime.timedelta(hours=1/(1/(24/1.00273781191135448)-1/(360*24/(1732564372.58130/3600/36525)))) # mean time between two moon transits in hours
 
 asi_filename = '/usr/lib/libASICamera2.so'
+homematic_ip = "10.0.1.37" # Use IP instead of name resolution for write requests to Homematic to reduce dependency on DNS service
 
 class IsDay():
     """
@@ -68,7 +70,7 @@ class IsDay():
         self.position.date = datetime.datetime.utcnow()
         if output:
             print("Date and Time (UTC): %s" % self.position.date)
-        sun = ephem.Sun(self.position)
+        sun = ephem.Sun(self.position) #pylint: disable=E1101
         sun.compute(self.position)
         result = (sun.alt > args.twilightalt*math.pi/180)
         if output:
@@ -91,7 +93,7 @@ def save_control_values(filename, settings, params):
     print('Camera settings saved to %s' % filename)
     #Write Camera Focus measure into Homematic
     try:
-        r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22416&new_value="+"{:.4f}".format(params["Focus"]))
+        r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=22416&new_value="+"{:.4f}".format(params["Focus"]))
     except ConnectionError:
         print("Data could not be written into the Homematic system variables.")
     if r.status_code != requests.codes['ok']:
@@ -190,7 +192,7 @@ def writeImage(filename, img, camera, args, timestring):
         for tag, value in exiftags.items():
             exifpars.append("-{}={}".format(tag, value))
         exifpars.append(filename)
-        process = subprocess.run(exifpars, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        process = subprocess.run(exifpars, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True)
 
         if 'debug' in args.debug:
             print('->Write Image: EXIFtool stdout: %s' % process.stdout)
@@ -227,8 +229,7 @@ def fitgaussian(data):
     """Returns (height, x, y, width_x, width_y)
     the gaussian parameters of a 2D distribution found by a fit"""
     params = moments(data)
-    errorfunction = lambda p: np.ravel(gaussian(*p)(*np.indices(data.shape)) -
-                                       data)
+    errorfunction = lambda p: np.ravel(gaussian(*p)(*np.indices(data.shape)) - data) #pylint: disable=E1120
     p, _ = optimize.leastsq(errorfunction, params)
     return p
 
@@ -335,7 +336,7 @@ def postprocess(args, camera):
             # inset axes....
             axins = ax.inset_axes([0.75, 0.75, 0.24, 0.24])
             axins.imshow(img, interpolation="nearest", origin="lower")
-            axins.contour(fit(*np.indices(img.shape)), 6, cmap=plt.get_cmap('copper'))
+            axins.contour(fit(*np.indices(img.shape)), 6, cmap=plt.get_cmap('copper')) #pylint: disable=E1120
             (height, x, y, width_x[idx], width_y[idx]) = params
 
             axins.text(0.95, 0.05, """
@@ -531,22 +532,30 @@ def postprocess(args, camera):
             print("->Postprocess: Image", geogrfile, " written to file-system : ", status)
         # Copy all image files over to server (images are kept on the camera "nightstokeep" times)
         if args.serverrepo != 'none' and ('images' in args.copypolicy or 'images' in args.movepolicy):
-            print('Copying/Moving images to server repository.')
-            if '@' in args.serverrepo:
-                os.system("scp "+args.dirtime_12h_ago_path+"/"+
-                          args.filename[:-4]+"*."+args.extension+" "+
-                          args.serverrepo+"/"+args.dirtime_12h_ago+"/")
-                if 'txt' in args.metadata:
-                    os.system("scp "+args.dirtime_12h_ago_path+"/"+
-                              args.filename[:-4]+"*.txt "+
-                              args.serverrepo+"/"+args.dirtime_12h_ago+"/")
-            else:
+            # Before copying to the server check if mountpoint still exists
+            if not os.path.ismount(args.serverrepo):
+                # Try to remount server mount point
                 try:
-                    shutil.copytree(args.dirtime_12h_ago_path, os.path.join(args.serverrepo, args.dirtime_12h_ago))
-                except shutil.Error as err:
-                    print('->Postprocess: When copying image directory', args.dirtime_12h_ago,
-                          'to directory', os.path.join(args.serverrepo, args.dirtime_12h_ago),
-                          'an Error', err, 'occured.')
+                    mount(args.serverrepo)
+                except:
+                    print("Server Repository", args.serverrepo, "not mountable! Stopping filetransfer....")
+                else:
+                    print('Copying/Moving images to server repository.')
+                    if '@' in args.serverrepo:
+                        os.system("scp "+args.dirtime_12h_ago_path+"/"+
+                                  args.filename[:-4]+"*."+args.extension+" "+
+                                  args.serverrepo+"/"+args.dirtime_12h_ago+"/")
+                        if 'txt' in args.metadata:
+                            os.system("scp "+args.dirtime_12h_ago_path+"/"+
+                                      args.filename[:-4]+"*.txt "+
+                                      args.serverrepo+"/"+args.dirtime_12h_ago+"/")
+                    else:
+                        try:
+                            shutil.copytree(args.dirtime_12h_ago_path, os.path.join(args.serverrepo, args.dirtime_12h_ago))
+                        except shutil.Error as err:
+                            print('->Postprocess: When copying image directory', args.dirtime_12h_ago,
+                                  'to directory', os.path.join(args.serverrepo, args.dirtime_12h_ago),
+                                  'an Error', err, 'occured.')
 #                if 'images' in args.movepolicy:
 #                    map(os.remove, imgfiles)
 
@@ -710,25 +719,25 @@ class dht22Thread(threading.Thread):
         while True:
             try:
                 #Read data of DHT22 sensor
-                dht22data = subprocess.run(['/home/rainer/Documents/AllSkyCam/AllSkyCapture/readdht22.sh'], stdout=subprocess.PIPE, timeout=self.timeout)
+                dht22data = subprocess.run(['/home/rainer/Documents/AllSkyCam/AllSkyCapture/readdht22.sh'], stdout=subprocess.PIPE, timeout=self.timeout, check=True)
                 self.dht22hum, self.dht22temp = [float(i) for i in re.split(' \= | \%| \*', dht22data.stdout.decode('ascii'))[1::2][:-1]]
                 #Write data of DHT22 sensor into Homematic
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22276,22275&new_value="+"{:.1f},{:.1f}".format(self.dht22hum, self.dht22temp))
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=22276,22275&new_value="+"{:.1f},{:.1f}".format(self.dht22hum, self.dht22temp))
                 except ConnectionError:
                     print("->DHT22: Data could not be written into the Homematic system variables.")
                 if r.status_code != requests.codes['ok']:
                     print("->DHT22: Data could not be written into the Homematic system variables.")
                 #Write Camera Sensor Temperature into Homematic
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22277&new_value="+"{:.1f}".format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=22277&new_value="+"{:.1f}".format(camera.get_control_value(asi.ASI_TEMPERATURE)[0]/10))
                 except ConnectionError:
                     print("->DHT22: Data could not be written into the Homematic system variables.")
                 if r.status_code != requests.codes['ok']:
                     print("->DHT22: Data could not be written into the Homematic system variables.")
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/sysvar.cgi?ise_id=20766")
                 except ConnectionError:
                     print("->DHT22: Air pressure data could not be read from the Homatic system variables.")
                 self.pressure = float(re.split('\=| ', r.text)[12][1:-1])
@@ -740,7 +749,7 @@ class dht22Thread(threading.Thread):
                 self.specific_humidity = mcalc.specific_humidity_from_mixing_ratio(self.mixratio)
                 self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, self.temperature, press).magnitude
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=22278&new_value="+"{:.1f}".format(self.dewpoint))
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=22278&new_value="+"{:.1f}".format(self.dewpoint))
                 except ConnectionError:
                     print("->DHT22: Data could not be written into the Homematic system variables.")
                 if r.status_code != requests.codes['ok']:
@@ -784,7 +793,7 @@ class WeatherThread(threading.Thread):
                 #Read data of Homematic sensor
                 #Read Temperature at Roof
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12378")
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/state.cgi?datapoint_id=12378")
                 except ConnectionError:
                     print("->Weather: Roof Temperature Data could not be read from the Homematic system.")
                 if r.status_code != requests.codes['ok']:
@@ -794,7 +803,7 @@ class WeatherThread(threading.Thread):
                 temp = units.Quantity(self.temperature, 'degC')
                 #Read Humidity at Roof
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12380")
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/state.cgi?datapoint_id=12380")
                 except ConnectionError:
                     print("->Weather: Roof Humidity Data could not be read from the Homematic system.")
                 if r.status_code != requests.codes['ok']:
@@ -802,7 +811,7 @@ class WeatherThread(threading.Thread):
                 self.humidity = float(re.split('=|/|\'', r.text)[-4])
                 #Read Light Intensity at Roof
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/state.cgi?datapoint_id=12382")
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/state.cgi?datapoint_id=12382")
                 except ConnectionError:
                     print("->Weather: Roof Light Intensity Data could not be read from the Homematic system.")
                 if r.status_code != requests.codes['ok']:
@@ -810,7 +819,7 @@ class WeatherThread(threading.Thread):
                 self.intensity = float(re.split('=|/|\'', r.text)[-4])
                 #Read Air pressure from Homematic and convert the XML result from request into float of pressure in hPa
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/sysvar.cgi?ise_id=20766")
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/sysvar.cgi?ise_id=20766")
                 except ConnectionError:
                     print("->Weather: Air pressure data could not be read from the Homatic system variables.")
                 self.pressure = float(re.split('\=| ', r.text)[12][1:-1])
@@ -821,7 +830,7 @@ class WeatherThread(threading.Thread):
                 self.specific_humidity = mcalc.specific_humidity_from_mixing_ratio(self.mixratio)
                 self.dewpoint = mcalc.dewpoint_from_specific_humidity(self.specific_humidity, temp, press).magnitude
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24771&new_value="+"{:.1f}".format(self.dewpoint))
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=24771&new_value="+"{:.1f}".format(self.dewpoint))
                 except ConnectionError:
                     print("->Weather: External Dew Point Data could not be written into the Homatic system variables.")
                 if r.status_code != requests.codes['ok']:
@@ -977,7 +986,7 @@ class IRSensorThread(threading.Thread):
                     print("->IRSensor: Output: TAmbient = %.2f°C / TSky = %.2f°C" % (self.Ta, self.Tobj))
                 #Write data of MLX90614 IR sensor into Homematic
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24737,24738&new_value="+"{:.1f},{:.1f}".format(self.Ta, self.Tobj))
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=24737,24738&new_value="+"{:.1f},{:.1f}".format(self.Ta, self.Tobj))
                 except ConnectionError:
                     print("->IRSensor: Data could not be written into the Homatic system variables.")
                 if r.status_code != requests.codes['ok']:
@@ -1107,7 +1116,7 @@ def heaterControl(tambient, tdewpoint, focusscale, sensitivity=1.5, hysteresis=1
         turnonHeater()
         #Write data of MLX90614 IR sensor into Homematic
         try:
-            r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=1")
+            r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=24816&new_value=1")
         except ConnectionError:
             print("-> heaterControl: Data could not be written into the Homatic system variable.")
         if r.status_code != requests.codes['ok']:
@@ -1116,7 +1125,7 @@ def heaterControl(tambient, tdewpoint, focusscale, sensitivity=1.5, hysteresis=1
     elif (heateron() and tambient - tdewpoint > sensitivity + hysteresis) or focusscale != '':
         turnoffHeater()
         try:
-            r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24816&new_value=0")
+            r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=24816&new_value=0")
         except ConnectionError:
             print("-> heaterControl: Data could not be written into the Homatic system variable.")
         if r.status_code != requests.codes['ok']:
@@ -1630,7 +1639,7 @@ class CurrentSensorThread(threading.Thread):
                     print("->Power Meter:                   Shunt Voltage: %.3f mV" % self.shunt_voltage)
                 #Write data of INA219 sensor into Homematic
                 try:
-                    r = requests.get("http://homematic.minixint.at/config/xmlapi/statechange.cgi?ise_id=24742,24743,24744,24745&new_value="+"{:.3f},{:.3f},{:.3f},{:.3f}".format(self.voltage, self.current, self.power, self.shunt_voltage))
+                    r = requests.get("http://"+homematic_ip+"/config/xmlapi/statechange.cgi?ise_id=24742,24743,24744,24745&new_value="+"{:.3f},{:.3f},{:.3f},{:.3f}".format(self.voltage, self.current, self.power, self.shunt_voltage))
                 except ConnectionError:
                     print("->Power Meter: Data could not be written into the Homatic system variables.")
                 if r.status_code != requests.codes['ok']:
@@ -2852,7 +2861,7 @@ if args.focusscale != '':
     atexit.register(turnOffMotors)
     myStepper = mh.getStepper(200, 1)      # motor port #1
     myStepper.setSpeed(5)                  # 5 RPM
-    
+
 
 else:
     focuscounter = -1
